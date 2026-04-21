@@ -7,8 +7,9 @@ const TARGET_CHANNEL_IDS = (process.env.TARGET_CHANNEL_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 const TARGET_VIDEO_IDS = (process.env.TARGET_VIDEO_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
-const NTFY_TOPIC = process.env.NTFY_TOPIC || "";
-const PORT = process.env.PORT || 3000;
+const NTFY_TOPIC        = process.env.NTFY_TOPIC || "";
+const YOUTUBE_COOKIES   = process.env.YOUTUBE_COOKIES || "";
+const PORT              = process.env.PORT || 3000;
 
 if (!NTFY_TOPIC) throw new Error("NTFY_TOPIC env var is required");
 
@@ -22,7 +23,7 @@ const COOLDOWN_MS     = 10_000;
 const LOG_MAX_ENTRIES = 200;
 const MAX_SEEN_IDS    = 5000;
 
-// ─── LOGGING ─────────────────────────────────────────────────────────────────
+// ─── LOGGING ──────────────────────────────────────────────────────────────────
 function log(videoId, level, message) {
   const entry = { ts: new Date().toISOString(), level, message };
   if (!streamLogs.has(videoId)) streamLogs.set(videoId, []);
@@ -33,43 +34,89 @@ function log(videoId, level, message) {
 }
 
 // ─── HEADERS ──────────────────────────────────────────────────────────────────
-const BROWSER_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-  "Cache-Control": "no-cache",
-  "Pragma": "no-cache",
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "none",
-  "Upgrade-Insecure-Requests": "1",
-};
+function getBrowserHeaders() {
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language":          "en-US,en;q=0.9",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Cache-Control":            "no-cache",
+    "Pragma":                   "no-cache",
+    "Sec-Ch-Ua":                '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":         "?0",
+    "Sec-Ch-Ua-Platform":       '"Windows"',
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-Site":           "none",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests":"1",
+  };
+  if (YOUTUBE_COOKIES) headers["Cookie"] = YOUTUBE_COOKIES;
+  return headers;
+}
 
-const API_HEADERS = {
-  "User-Agent": BROWSER_HEADERS["User-Agent"],
-  "Accept-Language": "en-US,en;q=0.9",
-  "Content-Type": "application/json",
-  "Origin": "https://www.youtube.com",
-  "Referer": "https://www.youtube.com/",
-  "X-Youtube-Client-Name": "1",
-  "X-Youtube-Client-Version": "2.20240101.00.00",
-  "Sec-Fetch-Dest": "empty",
-  "Sec-Fetch-Mode": "cors",
-  "Sec-Fetch-Site": "same-origin",
-};
+function getApiHeaders() {
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language":    "en-US,en;q=0.9",
+    "Accept":             "*/*",
+    "Content-Type":       "application/json",
+    "Origin":             "https://www.youtube.com",
+    "Referer":            `https://www.youtube.com/`,
+    "X-Youtube-Client-Name":    "1",
+    "X-Youtube-Client-Version": "2.20240101.00.00",
+    "Sec-Ch-Ua":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":   "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest":     "empty",
+    "Sec-Fetch-Mode":     "cors",
+    "Sec-Fetch-Site":     "same-origin",
+  };
+  if (YOUTUBE_COOKIES) headers["Cookie"] = YOUTUBE_COOKIES;
+  return headers;
+}
+
+// ─── AXIOS WITH 429 HANDLING ──────────────────────────────────────────────────
+async function axiosWithRetry(config, videoId, maxRetries = 5) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await axios(config);
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 429) {
+        attempt++;
+        // Respect Retry-After header if present, else exponential backoff
+        const retryAfter = err?.response?.headers?.["retry-after"];
+        const waitMs = retryAfter
+          ? parseInt(retryAfter) * 1000
+          : Math.min(30_000 * Math.pow(2, attempt - 1), 300_000);
+        log(videoId, "WARN",
+          `429 Rate limited — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${maxRetries})`
+        );
+        await sleep(waitMs);
+        continue;
+      }
+      throw err; // non-429 errors bubble up
+    }
+  }
+  throw new Error("Max retries exceeded after repeated 429s");
+}
 
 // ─── FETCH INITIAL CHAT DATA ──────────────────────────────────────────────────
 async function fetchInitialChatData(videoId) {
-  const res = await axios.get(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: BROWSER_HEADERS,
+  const res = await axiosWithRetry({
+    method: "get",
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    headers: getBrowserHeaders(),
     timeout: 20_000,
-  });
+  }, videoId);
 
   const html = res.data;
 
-  // Debug flags
   const isLiveFlag      = html.includes('"isLive":true');
   const hasChat         = html.includes('liveChatRenderer');
   const hasContinuation = html.includes('"continuation"');
@@ -77,7 +124,7 @@ async function fetchInitialChatData(videoId) {
     `Page fetched — isLive=${isLiveFlag} hasChat=${hasChat} hasContinuation=${hasContinuation}`
   );
 
-  // Extract ytInitialData — try multiple regex patterns
+  // Extract ytInitialData
   let ytData = null;
   const patterns = [
     /ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s,
@@ -87,39 +134,28 @@ async function fetchInitialChatData(videoId) {
   for (const pattern of patterns) {
     const match = html.match(pattern);
     if (match) {
-      try {
-        ytData = JSON.parse(match[1]);
-        break;
-      } catch {}
+      try { ytData = JSON.parse(match[1]); break; } catch {}
     }
   }
-
   if (!ytData) throw new Error("Could not parse ytInitialData from page");
 
-  // Extract API key
-  const apiKeyMatch = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
-  const apiKey = apiKeyMatch?.[1] || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  const apiKeyMatch       = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+  const clientVersionMatch= html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
+  const visitorDataMatch  = html.match(/"visitorData"\s*:\s*"([^"]+)"/);
 
-  // Extract client version
-  const clientVersionMatch = html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
+  const apiKey        = apiKeyMatch?.[1]        || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
   const clientVersion = clientVersionMatch?.[1] || "2.20240101.00.00";
+  const visitorData   = visitorDataMatch?.[1]   || "";
 
-  // Extract visitor data
-  const visitorDataMatch = html.match(/"visitorData"\s*:\s*"([^"]+)"/);
-  const visitorData = visitorDataMatch?.[1] || "";
-
-  log(videoId, "DEBUG", `apiKey=${apiKey.slice(0, 10)}... clientVersion=${clientVersion}`);
+  log(videoId, "DEBUG", `clientVersion=${clientVersion} visitorData=${visitorData.slice(0,20)}...`);
 
   const continuation = extractInitialContinuation(ytData, html);
-
   if (!continuation) {
-    if (!isLiveFlag && !hasChat) {
-      throw new Error("Stream does not appear to be live");
-    }
+    if (!isLiveFlag && !hasChat) throw new Error("Stream does not appear to be live");
     throw new Error("Could not find live chat continuation token");
   }
 
-  log(videoId, "DEBUG", `Got continuation token: ${continuation.slice(0, 30)}...`);
+  log(videoId, "DEBUG", `Token: ${continuation.slice(0, 40)}...`);
   return { continuation, apiKey, clientVersion, visitorData };
 }
 
@@ -127,61 +163,48 @@ async function fetchInitialChatData(videoId) {
 function extractInitialContinuation(ytData, html) {
   const candidates = [];
 
-  // Path 1: standard conversationBar
   try {
     const continuations = ytData?.contents?.twoColumnWatchNextResults
       ?.conversationBar?.liveChatRenderer?.continuations;
-    if (continuations) {
-      for (const c of continuations) {
+    if (continuations) for (const c of continuations) {
+      candidates.push(
+        c?.timedContinuationData?.continuation,
+        c?.invalidationContinuationData?.continuation,
+        c?.liveChatReplayContinuationData?.continuation
+      );
+    }
+  } catch {}
+
+  try {
+    for (const panel of ytData?.engagementPanels || []) {
+      const renderer = panel?.engagementPanelSectionListRenderer
+        ?.content?.liveChatRenderer;
+      if (renderer?.continuations) for (const c of renderer.continuations) {
         candidates.push(
           c?.timedContinuationData?.continuation,
-          c?.invalidationContinuationData?.continuation,
-          c?.liveChatReplayContinuationData?.continuation
+          c?.invalidationContinuationData?.continuation
         );
       }
     }
   } catch {}
 
-  // Path 2: engagement panels
-  try {
-    const panels = ytData?.engagementPanels || [];
-    for (const panel of panels) {
-      const renderer = panel?.engagementPanelSectionListRenderer
-        ?.content?.liveChatRenderer;
-      if (renderer?.continuations) {
-        for (const c of renderer.continuations) {
-          candidates.push(
-            c?.timedContinuationData?.continuation,
-            c?.invalidationContinuationData?.continuation
-          );
-        }
-      }
-    }
-  } catch {}
-
-  // Path 3: sidebar / submenus
   try {
     const results = ytData?.contents?.twoColumnWatchNextResults;
-    const secondary = results?.secondaryResults?.secondaryResults?.results || [];
-    for (const item of secondary) {
+    for (const item of results?.secondaryResults?.secondaryResults?.results || []) {
       const chat = item?.liveChatRenderer;
-      if (chat?.continuations) {
-        for (const c of chat.continuations) {
-          candidates.push(c?.timedContinuationData?.continuation);
-        }
+      if (chat?.continuations) for (const c of chat.continuations) {
+        candidates.push(c?.timedContinuationData?.continuation);
       }
     }
   } catch {}
 
-  // Path 4: deep regex search in raw HTML (most resilient)
+  // Deep regex on raw HTML
   try {
-    if (html) {
-      const matches = [...html.matchAll(/"continuation"\s*:\s*"(op[^"]{20,})"/g)];
-      for (const m of matches) candidates.push(m[1]);
-    }
+    const matches = [...html.matchAll(/"continuation"\s*:\s*"(op[^"]{20,})"/g)];
+    for (const m of matches) candidates.push(m[1]);
   } catch {}
 
-  // Path 5: deep regex in stringified ytData
+  // Deep regex on stringified ytData
   try {
     const str = JSON.stringify(ytData);
     const matches = [...str.matchAll(/"continuation"\s*:\s*"(op[^"]{20,})"/g)];
@@ -192,27 +215,27 @@ function extractInitialContinuation(ytData, html) {
 }
 
 // ─── FETCH LIVE CHAT PAGE ─────────────────────────────────────────────────────
-async function fetchLiveChatPage(apiKey, clientVersion, visitorData, continuation) {
+async function fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, continuation) {
   const url = `https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${apiKey}`;
 
-  const body = {
-    context: {
-      client: {
-        clientName: "WEB",
-        clientVersion,
-        visitorData,
-        hl: "en",
-        gl: "US",
-        userAgent: BROWSER_HEADERS["User-Agent"],
+  const res = await axiosWithRetry({
+    method: "post",
+    url,
+    headers: getApiHeaders(),
+    data: {
+      context: {
+        client: {
+          clientName: "WEB",
+          clientVersion,
+          visitorData,
+          hl: "en",
+          gl: "US",
+        },
       },
+      continuation,
     },
-    continuation,
-  };
-
-  const res = await axios.post(url, body, {
-    headers: API_HEADERS,
     timeout: 30_000,
-  });
+  }, videoId);
 
   return parseChatResponse(res.data);
 }
@@ -220,7 +243,7 @@ async function fetchLiveChatPage(apiKey, clientVersion, visitorData, continuatio
 function parseChatResponse(data) {
   const messages = [];
   let nextContinuation = null;
-  let timeoutMs = 2000;
+  let timeoutMs = 3000;
 
   const renderer =
     data?.continuationContents?.liveChatContinuation ||
@@ -232,7 +255,7 @@ function parseChatResponse(data) {
     const timed = c?.timedContinuationData || c?.invalidationContinuationData;
     if (timed) {
       nextContinuation = timed.continuation;
-      timeoutMs = timed.timeoutMs ?? 2000;
+      timeoutMs = timed.timeoutMs ?? 3000;
       break;
     }
   }
@@ -244,16 +267,13 @@ function parseChatResponse(data) {
       action?.addChatItemAction?.item?.liveChatMembershipItemRenderer;
     if (!item) continue;
 
-    const id = item.id;
-    const authorName = item.authorName?.simpleText || "Unknown";
+    const id              = item.id;
+    const authorName      = item.authorName?.simpleText || "Unknown";
     const authorChannelId = item.authorExternalChannelId || "";
     const text = (item.message?.runs || item.headerSubtext?.runs || [])
-      .map(r => r.text || "")
-      .join("");
+      .map(r => r.text || "").join("");
 
-    if (id && text) {
-      messages.push({ id, authorName, authorChannelId, text });
-    }
+    if (id && text) messages.push({ id, authorName, authorChannelId, text });
   }
 
   return { messages, nextContinuation, timeoutMs };
@@ -264,22 +284,16 @@ function isSeen(videoId, msgId) {
   if (!seenMessageIds.has(videoId)) seenMessageIds.set(videoId, new Set());
   return seenMessageIds.get(videoId).has(msgId);
 }
-
 function markSeen(videoId, msgId) {
   const set = seenMessageIds.get(videoId);
   set.add(msgId);
-  if (set.size > MAX_SEEN_IDS) {
-    set.delete(set.values().next().value);
-  }
+  if (set.size > MAX_SEEN_IDS) set.delete(set.values().next().value);
 }
 
 // ─── COOLDOWN ─────────────────────────────────────────────────────────────────
 function isOnCooldown(videoId, authorId) {
-  const key = `${videoId}:${authorId}`;
-  const last = userCooldowns.get(key) || 0;
-  return Date.now() - last < COOLDOWN_MS;
+  return Date.now() - (userCooldowns.get(`${videoId}:${authorId}`) || 0) < COOLDOWN_MS;
 }
-
 function setCooldown(videoId, authorId) {
   userCooldowns.set(`${videoId}:${authorId}`, Date.now());
 }
@@ -287,20 +301,16 @@ function setCooldown(videoId, authorId) {
 // ─── NTFY ─────────────────────────────────────────────────────────────────────
 async function sendNotification(videoId, authorName, messageText) {
   try {
-    await axios.post(
-      `https://ntfy.sh/${NTFY_TOPIC}`,
-      messageText,
-      {
-        headers: {
-          Title: `💬 ${authorName} in ${videoId}`,
-          Tags: "youtube,live",
-          Priority: "high",
-          "Content-Type": "text/plain",
-        },
-        timeout: 10_000,
-      }
-    );
-    log(videoId, "NOTIFY", `Sent: ${authorName}: ${messageText.slice(0, 60)}`);
+    await axios.post(`https://ntfy.sh/${NTFY_TOPIC}`, messageText, {
+      headers: {
+        Title:          `💬 ${authorName} in ${videoId}`,
+        Tags:           "youtube,live",
+        Priority:       "high",
+        "Content-Type": "text/plain",
+      },
+      timeout: 10_000,
+    });
+    log(videoId, "NOTIFY", `${authorName}: ${messageText.slice(0, 60)}`);
   } catch (err) {
     log(videoId, "ERROR", `ntfy failed: ${err.message}`);
   }
@@ -317,7 +327,6 @@ async function processMessages(videoId, messages) {
       TARGET_CHANNEL_IDS.includes(msg.authorChannelId);
 
     if (!shouldNotify) continue;
-
     if (isOnCooldown(videoId, msg.authorChannelId)) {
       log(videoId, "COOLDOWN", `Skipped ${msg.authorName}`);
       continue;
@@ -335,42 +344,34 @@ async function streamListener(videoId) {
   activeStreams.set(videoId, { status: "initializing", since: new Date().toISOString() });
 
   let retryCount = 0;
-  const RETRY_BASE_MS  = 5_000;
-  const RETRY_MAX_MS   = 120_000;
 
   while (true) {
     try {
-      log(videoId, "INFO", "Fetching initial chat data from watch page...");
+      log(videoId, "INFO", "Fetching initial chat data...");
       const { continuation: initCont, apiKey, clientVersion, visitorData } =
         await fetchInitialChatData(videoId);
 
-      activeStreams.set(videoId, {
-        status: "live",
-        since: new Date().toISOString(),
-        retries: retryCount,
-      });
+      activeStreams.set(videoId, { status: "live", since: new Date().toISOString(), retries: retryCount });
       retryCount = 0;
-      log(videoId, "INFO", "Connected to live chat stream ✅");
+      log(videoId, "INFO", "✅ Connected to live chat");
 
       let continuation = initCont;
 
       while (true) {
         if (!continuation) {
-          log(videoId, "WARN", "No continuation — stream may have ended");
+          log(videoId, "WARN", "No continuation — stream ended");
           break;
         }
 
         const { messages, nextContinuation, timeoutMs } =
-          await fetchLiveChatPage(apiKey, clientVersion, visitorData, continuation);
+          await fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, continuation);
 
-        log(videoId, "DEBUG", `Fetched ${messages.length} messages, next wait: ${timeoutMs}ms`);
+        log(videoId, "DEBUG", `${messages.length} messages | next in ${timeoutMs}ms`);
         await processMessages(videoId, messages);
 
         continuation = nextContinuation;
         if (timeoutMs > 0) await sleep(timeoutMs);
       }
-
-      log(videoId, "WARN", "Stream ended — will retry");
 
     } catch (err) {
       const offline = err.message?.includes("not appear to be live");
@@ -383,11 +384,11 @@ async function streamListener(videoId) {
       });
 
       if (offline) {
-        log(videoId, "INFO", "Stream offline — checking again in 60s");
+        log(videoId, "INFO", "Offline — retrying in 60s");
         await sleep(60_000);
       } else {
         retryCount++;
-        const delay = Math.min(RETRY_BASE_MS * Math.pow(1.5, retryCount - 1), RETRY_MAX_MS);
+        const delay = Math.min(15_000 * Math.pow(1.5, retryCount - 1), 120_000);
         log(videoId, "INFO", `Reconnecting in ${Math.round(delay / 1000)}s (retry ${retryCount})`);
         await sleep(delay);
       }
@@ -398,10 +399,12 @@ async function streamListener(videoId) {
 // ─── CHANNEL WATCHER ──────────────────────────────────────────────────────────
 async function detectLiveStream(channelId) {
   try {
-    const res = await axios.get(
-      `https://www.youtube.com/@${channelId}/live`,
-      { headers: BROWSER_HEADERS, timeout: 15_000 }
-    );
+    const res = await axiosWithRetry({
+      method: "get",
+      url: `https://www.youtube.com/@${channelId}/live`,
+      headers: getBrowserHeaders(),
+      timeout: 15_000,
+    }, channelId);
     const html = res.data;
     const isLive = html.includes('"isLive":true');
     const vidMatch = html.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
@@ -413,14 +416,14 @@ async function detectLiveStream(channelId) {
 }
 
 async function channelWatcher(channelId) {
-  console.log(`[CHANNEL] Watching channel: ${channelId}`);
+  console.log(`[CHANNEL] Watching: ${channelId}`);
   const activeVideoIds = new Set();
 
   while (true) {
     try {
       const videoId = await detectLiveStream(channelId);
       if (videoId && !activeVideoIds.has(videoId)) {
-        console.log(`[CHANNEL] Detected live stream ${videoId} on ${channelId}`);
+        console.log(`[CHANNEL] Live stream detected: ${videoId}`);
         activeVideoIds.add(videoId);
         streamListener(videoId).catch(err =>
           console.error(`[STREAM] ${videoId} crashed: ${err.message}`)
@@ -437,9 +440,9 @@ async function channelWatcher(channelId) {
 function startStatusServer() {
   const app = express();
 
-  app.get("/", (req, res) => {
-    res.json({ status: "running", uptime: process.uptime() });
-  });
+  app.get("/", (req, res) =>
+    res.json({ status: "running", uptime: process.uptime() })
+  );
 
   app.get("/status", (req, res) => {
     const streams = {};
@@ -450,21 +453,14 @@ function startStatusServer() {
         logs: streamLogs.get(id)?.slice(-20) || [],
       };
     }
-    res.json({
-      uptime: process.uptime(),
-      monitoredVideos: TARGET_VIDEO_IDS,
-      monitoredChannels: TARGET_CHANNEL_IDS,
-      streams,
-    });
+    res.json({ uptime: process.uptime(), monitoredVideos: TARGET_VIDEO_IDS, streams });
   });
 
-  app.get("/logs/:videoId", (req, res) => {
-    res.json(streamLogs.get(req.params.videoId) || []);
-  });
+  app.get("/logs/:videoId", (req, res) =>
+    res.json(streamLogs.get(req.params.videoId) || [])
+  );
 
-  app.listen(PORT, () => {
-    console.log(`[STATUS] Server running on port ${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`[STATUS] Running on port ${PORT}`));
 }
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
@@ -477,6 +473,7 @@ async function main() {
   console.log(`  Videos  : ${TARGET_VIDEO_IDS.join(", ") || "(none)"}`);
   console.log(`  Channels: ${TARGET_CHANNEL_IDS.join(", ") || "(none)"}`);
   console.log(`  ntfy    : https://ntfy.sh/${NTFY_TOPIC}`);
+  console.log(`  Cookies : ${YOUTUBE_COOKIES ? "✅ provided" : "❌ none (may get 429s)"}`);
   console.log("═══════════════════════════════════════════");
 
   startStatusServer();
