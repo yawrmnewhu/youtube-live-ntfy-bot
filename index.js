@@ -79,7 +79,7 @@ function getApiHeaders() {
   return headers;
 }
 
-// ─── AXIOS WITH 429 HANDLING ──────────────────────────────────────────────────
+// ─── AXIOS WITH RETRY ─────────────────────────────────────────────────────────
 async function axiosWithRetry(config, label, maxRetries = 5) {
   let attempt = 0;
   while (attempt < maxRetries) {
@@ -93,7 +93,7 @@ async function axiosWithRetry(config, label, maxRetries = 5) {
         const waitMs = retryAfter
           ? parseInt(retryAfter) * 1000
           : Math.min(30_000 * Math.pow(2, attempt - 1), 300_000);
-        console.log(`[WARN] [${label}] 429 rate limited — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${maxRetries})`);
+        console.log(`[WARN] [${label}] 429 — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${maxRetries})`);
         await sleep(waitMs);
         continue;
       }
@@ -136,6 +136,16 @@ async function fetchInitialChatData(videoId) {
   }
   if (!ytData) throw new Error("Could not parse ytInitialData from page");
 
+  // Debug: dump conversationBar structure
+  try {
+    const chatSection = ytData?.contents?.twoColumnWatchNextResults?.conversationBar;
+    log(videoId, "DEBUG", `conversationBar keys: ${JSON.stringify(Object.keys(chatSection || {}))}`);
+    const lcr = chatSection?.liveChatRenderer;
+    log(videoId, "DEBUG", `liveChatRenderer continuations: ${JSON.stringify(lcr?.continuations?.slice(0, 1))}`);
+  } catch (e) {
+    log(videoId, "DEBUG", `debug dump failed: ${e.message}`);
+  }
+
   const apiKeyMatch        = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
   const clientVersionMatch = html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
   const visitorDataMatch   = html.match(/"visitorData"\s*:\s*"([^"]+)"/);
@@ -144,7 +154,7 @@ async function fetchInitialChatData(videoId) {
   const clientVersion = clientVersionMatch?.[1] || "2.20240101.00.00";
   const visitorData   = visitorDataMatch?.[1]   || "";
 
-  log(videoId, "DEBUG", `clientVersion=${clientVersion} visitorData=${visitorData.slice(0, 20)}...`);
+  log(videoId, "DEBUG", `clientVersion=${clientVersion}`);
 
   const continuation = extractInitialContinuation(ytData, html);
   if (!continuation) {
@@ -152,7 +162,7 @@ async function fetchInitialChatData(videoId) {
     throw new Error("Could not find live chat continuation token");
   }
 
-  log(videoId, "DEBUG", `Token: ${continuation.slice(0, 40)}...`);
+  log(videoId, "DEBUG", `Token: ${continuation.slice(0, 50)}...`);
   return { continuation, apiKey, clientVersion, visitorData };
 }
 
@@ -160,6 +170,7 @@ async function fetchInitialChatData(videoId) {
 function extractInitialContinuation(ytData, html) {
   const candidates = [];
 
+  // Path 1: conversationBar
   try {
     const continuations = ytData?.contents?.twoColumnWatchNextResults
       ?.conversationBar?.liveChatRenderer?.continuations;
@@ -172,6 +183,7 @@ function extractInitialContinuation(ytData, html) {
     }
   } catch {}
 
+  // Path 2: engagementPanels
   try {
     for (const panel of ytData?.engagementPanels || []) {
       const renderer = panel?.engagementPanelSectionListRenderer
@@ -185,6 +197,7 @@ function extractInitialContinuation(ytData, html) {
     }
   } catch {}
 
+  // Path 3: secondaryResults
   try {
     const results = ytData?.contents?.twoColumnWatchNextResults;
     for (const item of results?.secondaryResults?.secondaryResults?.results || []) {
@@ -195,20 +208,27 @@ function extractInitialContinuation(ytData, html) {
     }
   } catch {}
 
-  // Deep regex on raw HTML
+  // Path 4: deep regex on raw HTML — ANY token length 20+, no prefix restriction
   try {
-    const matches = [...html.matchAll(/"continuation"\s*:\s*"(op[^"]{20,})"/g)];
+    const matches = [...html.matchAll(/"continuation"\s*:\s*"([^"]{20,})"/g)];
     for (const m of matches) candidates.push(m[1]);
   } catch {}
 
-  // Deep regex on stringified ytData
+  // Path 5: deep regex on stringified ytData
   try {
     const str = JSON.stringify(ytData);
-    const matches = [...str.matchAll(/"continuation"\s*:\s*"(op[^"]{20,})"/g)];
+    const matches = [...str.matchAll(/"continuation"\s*:\s*"([^"]{20,})"/g)];
     for (const m of matches) candidates.push(m[1]);
   } catch {}
 
-  return candidates.find(Boolean) || null;
+  const found = candidates.filter(Boolean);
+  console.log(`[DEBUG] Found ${found.length} continuation candidates`);
+  if (found.length > 0) {
+    console.log(`[DEBUG] First: ${found[0].slice(0, 60)}...`);
+    console.log(`[DEBUG] All prefixes: ${found.slice(0, 5).map(t => t.slice(0, 10)).join(", ")}`);
+  }
+
+  return found[0] || null;
 }
 
 // ─── FETCH LIVE CHAT PAGE ─────────────────────────────────────────────────────
@@ -397,9 +417,8 @@ async function streamListener(videoId) {
   }
 }
 
-// ─── CHANNEL WATCHER (FIXED) ──────────────────────────────────────────────────
+// ─── CHANNEL WATCHER ──────────────────────────────────────────────────────────
 async function detectLiveStream(channelId) {
-  // Try correct URL formats for UC... channel IDs and @handles
   const urls = channelId.startsWith("UC")
     ? [
         `https://www.youtube.com/channel/${channelId}/live`,
@@ -419,21 +438,19 @@ async function detectLiveStream(channelId) {
         timeout: 15_000,
       }, channelId);
 
-      const html    = res.data;
-      const isLive  = html.includes('"isLive":true');
+      const html     = res.data;
+      const isLive   = html.includes('"isLive":true');
       const vidMatch = html.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
 
       if (vidMatch && isLive) {
-        console.log(`[CHANNEL] Found live stream ${vidMatch[1]} at ${url}`);
+        console.log(`[CHANNEL] ✅ Found live stream ${vidMatch[1]} at ${url}`);
         return vidMatch[1];
       }
-
       console.log(`[CHANNEL] No live stream at ${url} (isLive=${isLive})`);
     } catch (err) {
       console.log(`[CHANNEL] URL failed (${url}): ${err.message}`);
     }
   }
-
   return null;
 }
 
@@ -445,13 +462,13 @@ async function channelWatcher(channelId) {
     try {
       const videoId = await detectLiveStream(channelId);
       if (videoId && !activeVideoIds.has(videoId)) {
-        console.log(`[CHANNEL] ✅ Live stream detected: ${videoId}`);
+        console.log(`[CHANNEL] ✅ New live stream: ${videoId}`);
         activeVideoIds.add(videoId);
         streamListener(videoId).catch(err =>
           console.error(`[STREAM] ${videoId} crashed: ${err.message}`)
         );
       } else if (!videoId) {
-        console.log(`[CHANNEL] ${channelId} — no live stream found, checking again in 60s`);
+        console.log(`[CHANNEL] ${channelId} — no live stream, checking again in 60s`);
       }
     } catch (err) {
       console.error(`[CHANNEL] ${channelId} error: ${err.message}`);
