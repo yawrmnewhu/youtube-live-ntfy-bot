@@ -14,23 +14,34 @@ const YOUTUBE_COOKIES   = process.env.YOUTUBE_COOKIES || "";
 const PORT              = process.env.PORT || 3000;
 
 // Aggressive polling: override YT's suggested timeout (usually 5000ms) with floor/ceil
-const MIN_POLL_MS       = parseInt(process.env.MIN_POLL_MS || "800", 10);  // never wait less than this
-const MAX_POLL_MS       = parseInt(process.env.MAX_POLL_MS || "2000", 10); // never wait more than this
+const MIN_POLL_MS       = parseInt(process.env.MIN_POLL_MS || "800", 10);
+const MAX_POLL_MS       = parseInt(process.env.MAX_POLL_MS || "2000", 10);
 const CHANNEL_CHECK_MS  = parseInt(process.env.CHANNEL_CHECK_MS || "20000", 10);
 
 if (!NTFY_TOPIC) throw new Error("NTFY_TOPIC env var is required");
 
 // ─── HTTP CLIENTS WITH KEEP-ALIVE (huge latency win) ──────────────────────────
-const httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 32, keepAliveMsecs: 30_000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 32, keepAliveMsecs: 30_000 });
+const httpAgent  = new http.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  keepAliveMsecs: 30_000,
+});
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  keepAliveMsecs: 30_000,
+});
+
+// Raise listener limit — we have many concurrent workers sharing socket pool
+require("events").EventEmitter.defaultMaxListeners = 50;
+httpAgent.setMaxListeners(50);
+httpsAgent.setMaxListeners(50);
 
 // Dedicated axios instance — reuses sockets → saves ~200–500ms per request
 const yt = axios.create({
   httpAgent, httpsAgent,
   timeout: 15_000,
-  // Skip redirects we don't need
   maxRedirects: 3,
-  // Faster JSON parse path
   responseType: "json",
   validateStatus: s => s >= 200 && s < 300,
 });
@@ -123,7 +134,7 @@ async function fetchInitialChatData(videoId) {
     url: `https://www.youtube.com/watch?v=${videoId}`,
     headers: getBrowserHeaders(),
     responseType: "text",
-    transformResponse: [d => d], // don't try to JSON parse HTML
+    transformResponse: [d => d],
   }, videoId);
 
   const html = res.data;
@@ -158,14 +169,12 @@ async function fetchInitialChatData(videoId) {
 function extractInitialContinuation(ytData, html) {
   const candidates = [];
 
-  // Prefer invalidationContinuationData (fastest — server pushes when ready)
-  // Fall back to timedContinuationData
   try {
     const continuations = ytData?.contents?.twoColumnWatchNextResults
       ?.conversationBar?.liveChatRenderer?.continuations || [];
     for (const c of continuations) {
       candidates.push(
-        c?.invalidationContinuationData?.continuation, // fastest
+        c?.invalidationContinuationData?.continuation,
         c?.timedContinuationData?.continuation,
       );
     }
@@ -183,7 +192,6 @@ function extractInitialContinuation(ytData, html) {
     }
   } catch {}
 
-  // Regex fallback
   try {
     const str = JSON.stringify(ytData);
     const matches = [...str.matchAll(/"continuation"\s*:\s*"([^"]{20,})"/g)];
@@ -219,7 +227,6 @@ function parseChatResponse(data) {
     data?.contents?.liveChatContinuation;
   if (!renderer) return { messages, nextContinuation, timeoutMs };
 
-  // Prefer invalidation (push-style) over timed
   for (const c of renderer?.continuations || []) {
     const inv = c?.invalidationContinuationData;
     const timed = c?.timedContinuationData;
@@ -233,7 +240,6 @@ function parseChatResponse(data) {
     }
   }
 
-  // Clamp poll interval to our aggressive window
   timeoutMs = Math.max(MIN_POLL_MS, Math.min(timeoutMs, MAX_POLL_MS));
 
   const actions = renderer?.actions || [];
@@ -279,7 +285,6 @@ function setCooldown(videoId, authorId) {
 
 // ─── NTFY (fire-and-forget for lowest latency) ────────────────────────────────
 function sendNotification(videoId, authorName, messageText) {
-  // DON'T await — return immediately so we can keep processing
   ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, messageText, {
     headers: {
       Title: `💬 ${authorName} in ${videoId}`,
@@ -294,7 +299,7 @@ function sendNotification(videoId, authorName, messageText) {
   });
 }
 
-// ─── PROCESS MESSAGES (synchronous loop — no awaits inside) ───────────────────
+// ─── PROCESS MESSAGES ─────────────────────────────────────────────────────────
 function processMessages(videoId, messages) {
   const targets = TARGET_CHANNEL_IDS.length === 0 ? null : new Set(TARGET_CHANNEL_IDS);
   for (let i = 0; i < messages.length; i++) {
@@ -307,7 +312,7 @@ function processMessages(videoId, messages) {
 
     setCooldown(videoId, msg.authorChannelId);
     log(videoId, "MATCH", `${msg.authorName}: ${msg.text}`);
-    sendNotification(videoId, msg.authorName, msg.text); // fire-and-forget
+    sendNotification(videoId, msg.authorName, msg.text);
   }
 }
 
@@ -330,7 +335,6 @@ async function streamListener(videoId) {
       log(videoId, "INFO", "✅ Connected to live chat");
 
       let continuation = initCont;
-      // Pipeline: start next fetch while processing current
       let pendingFetch = null;
 
       while (continuation) {
@@ -340,15 +344,10 @@ async function streamListener(videoId) {
 
         const { messages, nextContinuation, timeoutMs } = await fetchPromise;
 
-        // Kick off next fetch IMMEDIATELY after current response arrives,
-        // before we process messages — this overlaps network + CPU work.
         if (nextContinuation) {
-          // Respect the timeout before firing next request to avoid hammering
-          // But start the timer now, so processing counts toward wait time
           const nextStart = Date.now();
           const requiredWait = timeoutMs;
 
-          // Process in parallel with wait
           processMessages(videoId, messages);
 
           const elapsed = Date.now() - nextStart;
