@@ -39,18 +39,18 @@ function getBrowserHeaders() {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language":          "en-US,en;q=0.9",
-    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Cache-Control":            "no-cache",
-    "Pragma":                   "no-cache",
-    "Sec-Ch-Ua":                '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile":         "?0",
-    "Sec-Ch-Ua-Platform":       '"Windows"',
-    "Sec-Fetch-Dest":           "document",
-    "Sec-Fetch-Mode":           "navigate",
-    "Sec-Fetch-Site":           "none",
-    "Sec-Fetch-User":           "?1",
-    "Upgrade-Insecure-Requests":"1",
+    "Accept-Language":           "en-US,en;q=0.9",
+    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Cache-Control":             "no-cache",
+    "Pragma":                    "no-cache",
+    "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":          "?0",
+    "Sec-Ch-Ua-Platform":        '"Windows"',
+    "Sec-Fetch-Dest":            "document",
+    "Sec-Fetch-Mode":            "navigate",
+    "Sec-Fetch-Site":            "none",
+    "Sec-Fetch-User":            "?1",
+    "Upgrade-Insecure-Requests": "1",
   };
   if (YOUTUBE_COOKIES) headers["Cookie"] = YOUTUBE_COOKIES;
   return headers;
@@ -61,26 +61,26 @@ function getApiHeaders() {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language":    "en-US,en;q=0.9",
-    "Accept":             "*/*",
-    "Content-Type":       "application/json",
-    "Origin":             "https://www.youtube.com",
-    "Referer":            `https://www.youtube.com/`,
+    "Accept-Language":          "en-US,en;q=0.9",
+    "Accept":                   "*/*",
+    "Content-Type":             "application/json",
+    "Origin":                   "https://www.youtube.com",
+    "Referer":                  "https://www.youtube.com/",
     "X-Youtube-Client-Name":    "1",
     "X-Youtube-Client-Version": "2.20240101.00.00",
-    "Sec-Ch-Ua":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile":   "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest":     "empty",
-    "Sec-Fetch-Mode":     "cors",
-    "Sec-Fetch-Site":     "same-origin",
+    "Sec-Ch-Ua":                '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":         "?0",
+    "Sec-Ch-Ua-Platform":       '"Windows"',
+    "Sec-Fetch-Dest":           "empty",
+    "Sec-Fetch-Mode":           "cors",
+    "Sec-Fetch-Site":           "same-origin",
   };
   if (YOUTUBE_COOKIES) headers["Cookie"] = YOUTUBE_COOKIES;
   return headers;
 }
 
 // ─── AXIOS WITH 429 HANDLING ──────────────────────────────────────────────────
-async function axiosWithRetry(config, videoId, maxRetries = 5) {
+async function axiosWithRetry(config, label, maxRetries = 5) {
   let attempt = 0;
   while (attempt < maxRetries) {
     try {
@@ -89,18 +89,15 @@ async function axiosWithRetry(config, videoId, maxRetries = 5) {
       const status = err?.response?.status;
       if (status === 429) {
         attempt++;
-        // Respect Retry-After header if present, else exponential backoff
         const retryAfter = err?.response?.headers?.["retry-after"];
         const waitMs = retryAfter
           ? parseInt(retryAfter) * 1000
           : Math.min(30_000 * Math.pow(2, attempt - 1), 300_000);
-        log(videoId, "WARN",
-          `429 Rate limited — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${maxRetries})`
-        );
+        console.log(`[WARN] [${label}] 429 rate limited — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${maxRetries})`);
         await sleep(waitMs);
         continue;
       }
-      throw err; // non-429 errors bubble up
+      throw err;
     }
   }
   throw new Error("Max retries exceeded after repeated 429s");
@@ -139,15 +136,15 @@ async function fetchInitialChatData(videoId) {
   }
   if (!ytData) throw new Error("Could not parse ytInitialData from page");
 
-  const apiKeyMatch       = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
-  const clientVersionMatch= html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
-  const visitorDataMatch  = html.match(/"visitorData"\s*:\s*"([^"]+)"/);
+  const apiKeyMatch        = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+  const clientVersionMatch = html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
+  const visitorDataMatch   = html.match(/"visitorData"\s*:\s*"([^"]+)"/);
 
   const apiKey        = apiKeyMatch?.[1]        || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
   const clientVersion = clientVersionMatch?.[1] || "2.20240101.00.00";
   const visitorData   = visitorDataMatch?.[1]   || "";
 
-  log(videoId, "DEBUG", `clientVersion=${clientVersion} visitorData=${visitorData.slice(0,20)}...`);
+  log(videoId, "DEBUG", `clientVersion=${clientVersion} visitorData=${visitorData.slice(0, 20)}...`);
 
   const continuation = extractInitialContinuation(ytData, html);
   if (!continuation) {
@@ -351,7 +348,11 @@ async function streamListener(videoId) {
       const { continuation: initCont, apiKey, clientVersion, visitorData } =
         await fetchInitialChatData(videoId);
 
-      activeStreams.set(videoId, { status: "live", since: new Date().toISOString(), retries: retryCount });
+      activeStreams.set(videoId, {
+        status: "live",
+        since: new Date().toISOString(),
+        retries: retryCount,
+      });
       retryCount = 0;
       log(videoId, "INFO", "✅ Connected to live chat");
 
@@ -396,22 +397,43 @@ async function streamListener(videoId) {
   }
 }
 
-// ─── CHANNEL WATCHER ──────────────────────────────────────────────────────────
+// ─── CHANNEL WATCHER (FIXED) ──────────────────────────────────────────────────
 async function detectLiveStream(channelId) {
-  try {
-    const res = await axiosWithRetry({
-      method: "get",
-      url: `https://www.youtube.com/@${channelId}/live`,
-      headers: getBrowserHeaders(),
-      timeout: 15_000,
-    }, channelId);
-    const html = res.data;
-    const isLive = html.includes('"isLive":true');
-    const vidMatch = html.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
-    if (vidMatch && isLive) return vidMatch[1];
-  } catch (err) {
-    console.error(`[CHANNEL] [${channelId}] Detection failed: ${err.message}`);
+  // Try correct URL formats for UC... channel IDs and @handles
+  const urls = channelId.startsWith("UC")
+    ? [
+        `https://www.youtube.com/channel/${channelId}/live`,
+        `https://www.youtube.com/channel/${channelId}`,
+      ]
+    : [
+        `https://www.youtube.com/@${channelId}/live`,
+        `https://www.youtube.com/@${channelId}`,
+      ];
+
+  for (const url of urls) {
+    try {
+      const res = await axiosWithRetry({
+        method: "get",
+        url,
+        headers: getBrowserHeaders(),
+        timeout: 15_000,
+      }, channelId);
+
+      const html    = res.data;
+      const isLive  = html.includes('"isLive":true');
+      const vidMatch = html.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
+
+      if (vidMatch && isLive) {
+        console.log(`[CHANNEL] Found live stream ${vidMatch[1]} at ${url}`);
+        return vidMatch[1];
+      }
+
+      console.log(`[CHANNEL] No live stream at ${url} (isLive=${isLive})`);
+    } catch (err) {
+      console.log(`[CHANNEL] URL failed (${url}): ${err.message}`);
+    }
   }
+
   return null;
 }
 
@@ -423,11 +445,13 @@ async function channelWatcher(channelId) {
     try {
       const videoId = await detectLiveStream(channelId);
       if (videoId && !activeVideoIds.has(videoId)) {
-        console.log(`[CHANNEL] Live stream detected: ${videoId}`);
+        console.log(`[CHANNEL] ✅ Live stream detected: ${videoId}`);
         activeVideoIds.add(videoId);
         streamListener(videoId).catch(err =>
           console.error(`[STREAM] ${videoId} crashed: ${err.message}`)
         );
+      } else if (!videoId) {
+        console.log(`[CHANNEL] ${channelId} — no live stream found, checking again in 60s`);
       }
     } catch (err) {
       console.error(`[CHANNEL] ${channelId} error: ${err.message}`);
@@ -453,7 +477,12 @@ function startStatusServer() {
         logs: streamLogs.get(id)?.slice(-20) || [],
       };
     }
-    res.json({ uptime: process.uptime(), monitoredVideos: TARGET_VIDEO_IDS, streams });
+    res.json({
+      uptime: process.uptime(),
+      monitoredVideos: TARGET_VIDEO_IDS,
+      monitoredChannels: TARGET_CHANNEL_IDS,
+      streams,
+    });
   });
 
   app.get("/logs/:videoId", (req, res) =>
