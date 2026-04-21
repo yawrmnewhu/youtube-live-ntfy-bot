@@ -13,14 +13,14 @@ const PORT = process.env.PORT || 3000;
 if (!NTFY_TOPIC) throw new Error("NTFY_TOPIC env var is required");
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-const seenMessageIds = new Map();   // videoId -> Set of message IDs
-const streamLogs     = new Map();   // videoId -> last N log entries
-const activeStreams  = new Map();   // videoId -> { status, continuation, ... }
-const userCooldowns  = new Map();   // `${videoId}:${authorId}` -> timestamp
+const seenMessageIds = new Map();
+const streamLogs     = new Map();
+const activeStreams  = new Map();
+const userCooldowns  = new Map();
 
-const COOLDOWN_MS     = 10_000;     // 10s anti-spam per user per stream
+const COOLDOWN_MS     = 10_000;
 const LOG_MAX_ENTRIES = 200;
-const MAX_SEEN_IDS    = 5000;       // cap memory per stream
+const MAX_SEEN_IDS    = 5000;
 
 // ─── LOGGING ─────────────────────────────────────────────────────────────────
 function log(videoId, level, message) {
@@ -32,116 +32,166 @@ function log(videoId, level, message) {
   console.log(`[${level}] [${videoId}] ${message}`);
 }
 
-// ─── YOUTUBE INTERNAL API HELPERS ─────────────────────────────────────────────
-
-// Mimics a real Chrome browser making the initial page request
+// ─── HEADERS ──────────────────────────────────────────────────────────────────
 const BROWSER_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "Accept-Language": "en-US,en;q=0.9",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," +
-    "image/webp,*/*;q=0.8",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Cache-Control": "no-cache",
-  Pragma: "no-cache",
+  "Pragma": "no-cache",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Upgrade-Insecure-Requests": "1",
 };
 
 const API_HEADERS = {
-  ...BROWSER_HEADERS,
+  "User-Agent": BROWSER_HEADERS["User-Agent"],
+  "Accept-Language": "en-US,en;q=0.9",
   "Content-Type": "application/json",
-  Origin: "https://www.youtube.com",
-  Referer: "https://www.youtube.com/",
+  "Origin": "https://www.youtube.com",
+  "Referer": "https://www.youtube.com/",
   "X-Youtube-Client-Name": "1",
   "X-Youtube-Client-Version": "2.20240101.00.00",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
 };
 
-/**
- * Fetches the YouTube watch page and extracts:
- * - Initial continuation token for live chat
- * - API key (INNERTUBE_API_KEY)
- * - Visitor data / client context
- */
+// ─── FETCH INITIAL CHAT DATA ──────────────────────────────────────────────────
 async function fetchInitialChatData(videoId) {
-  const url = `https://www.youtube.com/watch?v=${videoId}&pbj=1`;
   const res = await axios.get(`https://www.youtube.com/watch?v=${videoId}`, {
     headers: BROWSER_HEADERS,
-    timeout: 15_000,
+    timeout: 20_000,
   });
 
   const html = res.data;
 
-  // Extract ytInitialData JSON blob
-  const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s);
-  if (!dataMatch) throw new Error("Could not find ytInitialData in page");
+  // Debug flags
+  const isLiveFlag      = html.includes('"isLive":true');
+  const hasChat         = html.includes('liveChatRenderer');
+  const hasContinuation = html.includes('"continuation"');
+  log(videoId, "DEBUG",
+    `Page fetched — isLive=${isLiveFlag} hasChat=${hasChat} hasContinuation=${hasContinuation}`
+  );
+
+  // Extract ytInitialData — try multiple regex patterns
+  let ytData = null;
+  const patterns = [
+    /ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s,
+    /ytInitialData\s*=\s*(\{.+?\})\s*;/s,
+    /window\["ytInitialData"\]\s*=\s*(\{.+?\});/s,
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match) {
+      try {
+        ytData = JSON.parse(match[1]);
+        break;
+      } catch {}
+    }
+  }
+
+  if (!ytData) throw new Error("Could not parse ytInitialData from page");
 
   // Extract API key
   const apiKeyMatch = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
-  const apiKey = apiKeyMatch ? apiKeyMatch[1] : "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  const apiKey = apiKeyMatch?.[1] || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
   // Extract client version
   const clientVersionMatch = html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
-  const clientVersion = clientVersionMatch ? clientVersionMatch[1] : "2.20240101.00.00";
+  const clientVersion = clientVersionMatch?.[1] || "2.20240101.00.00";
 
   // Extract visitor data
   const visitorDataMatch = html.match(/"visitorData"\s*:\s*"([^"]+)"/);
-  const visitorData = visitorDataMatch ? visitorDataMatch[1] : "";
+  const visitorData = visitorDataMatch?.[1] || "";
 
-  let ytData;
-  try {
-    ytData = JSON.parse(dataMatch[1]);
-  } catch {
-    throw new Error("Failed to parse ytInitialData JSON");
-  }
+  log(videoId, "DEBUG", `apiKey=${apiKey.slice(0, 10)}... clientVersion=${clientVersion}`);
 
-  // Navigate to live chat continuation token
-  const continuation = extractInitialContinuation(ytData);
+  const continuation = extractInitialContinuation(ytData, html);
+
   if (!continuation) {
-    // Check if stream is offline / VOD
-    const isLive = html.includes('"isLive":true') || html.includes('"liveBroadcastDetails"');
-    if (!isLive) throw new Error("Stream does not appear to be live");
+    if (!isLiveFlag && !hasChat) {
+      throw new Error("Stream does not appear to be live");
+    }
     throw new Error("Could not find live chat continuation token");
   }
 
+  log(videoId, "DEBUG", `Got continuation token: ${continuation.slice(0, 30)}...`);
   return { continuation, apiKey, clientVersion, visitorData };
 }
 
-function extractInitialContinuation(ytData) {
+// ─── EXTRACT CONTINUATION TOKEN ───────────────────────────────────────────────
+function extractInitialContinuation(ytData, html) {
+  const candidates = [];
+
+  // Path 1: standard conversationBar
   try {
-    // Path 1: standard live chat tab
-    const tabs = ytData?.contents?.twoColumnWatchNextResults
+    const continuations = ytData?.contents?.twoColumnWatchNextResults
       ?.conversationBar?.liveChatRenderer?.continuations;
-    if (tabs) {
-      for (const c of tabs) {
-        const token =
-          c?.timedContinuationData?.continuation ||
-          c?.invalidationContinuationData?.continuation ||
-          c?.liveChatReplayContinuationData?.continuation;
-        if (token) return token;
+    if (continuations) {
+      for (const c of continuations) {
+        candidates.push(
+          c?.timedContinuationData?.continuation,
+          c?.invalidationContinuationData?.continuation,
+          c?.liveChatReplayContinuationData?.continuation
+        );
       }
     }
+  } catch {}
 
-    // Path 2: sub-menu panel
-    const panel = ytData?.contents?.twoColumnWatchNextResults
-      ?.conversationBar?.liveChatRenderer;
-    if (panel?.continuations?.[0]) {
-      const c = panel.continuations[0];
-      return (
-        c?.timedContinuationData?.continuation ||
-        c?.invalidationContinuationData?.continuation
-      );
+  // Path 2: engagement panels
+  try {
+    const panels = ytData?.engagementPanels || [];
+    for (const panel of panels) {
+      const renderer = panel?.engagementPanelSectionListRenderer
+        ?.content?.liveChatRenderer;
+      if (renderer?.continuations) {
+        for (const c of renderer.continuations) {
+          candidates.push(
+            c?.timedContinuationData?.continuation,
+            c?.invalidationContinuationData?.continuation
+          );
+        }
+      }
     }
   } catch {}
-  return null;
+
+  // Path 3: sidebar / submenus
+  try {
+    const results = ytData?.contents?.twoColumnWatchNextResults;
+    const secondary = results?.secondaryResults?.secondaryResults?.results || [];
+    for (const item of secondary) {
+      const chat = item?.liveChatRenderer;
+      if (chat?.continuations) {
+        for (const c of chat.continuations) {
+          candidates.push(c?.timedContinuationData?.continuation);
+        }
+      }
+    }
+  } catch {}
+
+  // Path 4: deep regex search in raw HTML (most resilient)
+  try {
+    if (html) {
+      const matches = [...html.matchAll(/"continuation"\s*:\s*"(op[^"]{20,})"/g)];
+      for (const m of matches) candidates.push(m[1]);
+    }
+  } catch {}
+
+  // Path 5: deep regex in stringified ytData
+  try {
+    const str = JSON.stringify(ytData);
+    const matches = [...str.matchAll(/"continuation"\s*:\s*"(op[^"]{20,})"/g)];
+    for (const m of matches) candidates.push(m[1]);
+  } catch {}
+
+  return candidates.find(Boolean) || null;
 }
 
-/**
- * Calls YouTube's internal /live_chat/get_live_chat endpoint.
- * Returns { messages, nextContinuation, timeoutMs }
- *
- * This is a LONG-POLL style call — YouTube itself does this every ~1-5s
- * in the browser. We honor whatever timeout YouTube gives us.
- */
+// ─── FETCH LIVE CHAT PAGE ─────────────────────────────────────────────────────
 async function fetchLiveChatPage(apiKey, clientVersion, visitorData, continuation) {
   const url = `https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${apiKey}`;
 
@@ -170,7 +220,7 @@ async function fetchLiveChatPage(apiKey, clientVersion, visitorData, continuatio
 function parseChatResponse(data) {
   const messages = [];
   let nextContinuation = null;
-  let timeoutMs = 2000; // default fallback
+  let timeoutMs = 2000;
 
   const renderer =
     data?.continuationContents?.liveChatContinuation ||
@@ -178,34 +228,31 @@ function parseChatResponse(data) {
 
   if (!renderer) return { messages, nextContinuation, timeoutMs };
 
-  // Extract next continuation + server-suggested timeout
   for (const c of renderer?.continuations || []) {
     const timed = c?.timedContinuationData || c?.invalidationContinuationData;
     if (timed) {
       nextContinuation = timed.continuation;
-      // YouTube tells us how long to wait (in ms) — respect it
       timeoutMs = timed.timeoutMs ?? 2000;
       break;
     }
   }
 
-  // Extract chat messages
   for (const action of renderer?.actions || []) {
     const item =
       action?.addChatItemAction?.item?.liveChatTextMessageRenderer ||
-      action?.addChatItemAction?.item?.liveChatPaidMessageRenderer;
+      action?.addChatItemAction?.item?.liveChatPaidMessageRenderer ||
+      action?.addChatItemAction?.item?.liveChatMembershipItemRenderer;
     if (!item) continue;
 
     const id = item.id;
     const authorName = item.authorName?.simpleText || "Unknown";
     const authorChannelId = item.authorExternalChannelId || "";
-    const text = (item.message?.runs || [])
+    const text = (item.message?.runs || item.headerSubtext?.runs || [])
       .map(r => r.text || "")
       .join("");
-    const timestampUsec = item.timestampUsec;
 
     if (id && text) {
-      messages.push({ id, authorName, authorChannelId, text, timestampUsec });
+      messages.push({ id, authorName, authorChannelId, text });
     }
   }
 
@@ -221,14 +268,12 @@ function isSeen(videoId, msgId) {
 function markSeen(videoId, msgId) {
   const set = seenMessageIds.get(videoId);
   set.add(msgId);
-  // Evict oldest entries if cap exceeded (crude but effective)
   if (set.size > MAX_SEEN_IDS) {
-    const first = set.values().next().value;
-    set.delete(first);
+    set.delete(set.values().next().value);
   }
 }
 
-// ─── ANTI-SPAM COOLDOWN ───────────────────────────────────────────────────────
+// ─── COOLDOWN ─────────────────────────────────────────────────────────────────
 function isOnCooldown(videoId, authorId) {
   const key = `${videoId}:${authorId}`;
   const last = userCooldowns.get(key) || 0;
@@ -239,7 +284,7 @@ function setCooldown(videoId, authorId) {
   userCooldowns.set(`${videoId}:${authorId}`, Date.now());
 }
 
-// ─── NTFY NOTIFICATION ────────────────────────────────────────────────────────
+// ─── NTFY ─────────────────────────────────────────────────────────────────────
 async function sendNotification(videoId, authorName, messageText) {
   try {
     await axios.post(
@@ -255,17 +300,13 @@ async function sendNotification(videoId, authorName, messageText) {
         timeout: 10_000,
       }
     );
-    log(videoId, "NOTIFY", `Sent notification for ${authorName}: ${messageText.slice(0, 60)}`);
+    log(videoId, "NOTIFY", `Sent: ${authorName}: ${messageText.slice(0, 60)}`);
   } catch (err) {
     log(videoId, "ERROR", `ntfy failed: ${err.message}`);
   }
 }
 
-// ─── STREAM LISTENER ──────────────────────────────────────────────────────────
-/**
- * Processes a batch of messages from one chat fetch.
- * Filters by TARGET_CHANNEL_IDS, deduplicates, applies cooldown, notifies.
- */
+// ─── PROCESS MESSAGES ─────────────────────────────────────────────────────────
 async function processMessages(videoId, messages) {
   for (const msg of messages) {
     if (isSeen(videoId, msg.id)) continue;
@@ -276,8 +317,9 @@ async function processMessages(videoId, messages) {
       TARGET_CHANNEL_IDS.includes(msg.authorChannelId);
 
     if (!shouldNotify) continue;
+
     if (isOnCooldown(videoId, msg.authorChannelId)) {
-      log(videoId, "COOLDOWN", `Skipped ${msg.authorName} (cooldown)`);
+      log(videoId, "COOLDOWN", `Skipped ${msg.authorName}`);
       continue;
     }
 
@@ -287,29 +329,17 @@ async function processMessages(videoId, messages) {
   }
 }
 
-/**
- * Main event-driven loop for a single video stream.
- *
- * Architecture note: This uses YouTube's OWN continuation/timeout mechanism.
- * YouTube's web client does the exact same thing. The server tells us
- * how long to wait (timeoutMs) before the next request — we honor that,
- * making this as efficient and "human-like" as possible.
- *
- * This is NOT interval polling — the delay between requests is dynamic
- * and server-dictated, identical to how the browser works.
- */
+// ─── STREAM LISTENER ──────────────────────────────────────────────────────────
 async function streamListener(videoId) {
   log(videoId, "INFO", "Starting stream listener");
   activeStreams.set(videoId, { status: "initializing", since: new Date().toISOString() });
 
   let retryCount = 0;
-  const MAX_RETRIES = 999; // practically infinite, but bounded
-  const RETRY_BASE_DELAY_MS = 5_000;
-  const RETRY_MAX_DELAY_MS = 120_000;
+  const RETRY_BASE_MS  = 5_000;
+  const RETRY_MAX_MS   = 120_000;
 
-  while (retryCount < MAX_RETRIES) {
+  while (true) {
     try {
-      // ── INIT PHASE ──────────────────────────────────────────────────────────
       log(videoId, "INFO", "Fetching initial chat data from watch page...");
       const { continuation: initCont, apiKey, clientVersion, visitorData } =
         await fetchInitialChatData(videoId);
@@ -319,92 +349,69 @@ async function streamListener(videoId) {
         since: new Date().toISOString(),
         retries: retryCount,
       });
-      retryCount = 0; // reset on successful connect
-      log(videoId, "INFO", "Connected to live chat stream");
+      retryCount = 0;
+      log(videoId, "INFO", "Connected to live chat stream ✅");
 
-      // ── STREAMING PHASE ─────────────────────────────────────────────────────
       let continuation = initCont;
 
       while (true) {
         if (!continuation) {
-          log(videoId, "WARN", "No continuation token — stream may have ended");
+          log(videoId, "WARN", "No continuation — stream may have ended");
           break;
         }
 
         const { messages, nextContinuation, timeoutMs } =
           await fetchLiveChatPage(apiKey, clientVersion, visitorData, continuation);
 
+        log(videoId, "DEBUG", `Fetched ${messages.length} messages, next wait: ${timeoutMs}ms`);
         await processMessages(videoId, messages);
 
         continuation = nextContinuation;
-
-        // Honor YouTube's server-suggested wait time (typically 1000–5000ms)
-        // This is how the YouTube browser client works — NOT arbitrary polling
-        if (timeoutMs > 0) {
-          await sleep(timeoutMs);
-        }
+        if (timeoutMs > 0) await sleep(timeoutMs);
       }
 
-      log(videoId, "WARN", "Stream ended or continuation exhausted — will retry");
+      log(videoId, "WARN", "Stream ended — will retry");
+
     } catch (err) {
-      const isStreamOffline = err.message?.includes("not appear to be live");
+      const offline = err.message?.includes("not appear to be live");
       log(videoId, "ERROR", `Stream error: ${err.message}`);
       activeStreams.set(videoId, {
-        status: isStreamOffline ? "offline" : "reconnecting",
+        status: offline ? "offline" : "reconnecting",
         since: new Date().toISOString(),
         error: err.message,
         retries: retryCount,
       });
 
-      if (isStreamOffline) {
-        // Stream not live — poll less aggressively to detect when it goes live
+      if (offline) {
         log(videoId, "INFO", "Stream offline — checking again in 60s");
         await sleep(60_000);
       } else {
         retryCount++;
-        const delay = Math.min(
-          RETRY_BASE_DELAY_MS * Math.pow(1.5, retryCount - 1),
-          RETRY_MAX_DELAY_MS
-        );
+        const delay = Math.min(RETRY_BASE_MS * Math.pow(1.5, retryCount - 1), RETRY_MAX_MS);
         log(videoId, "INFO", `Reconnecting in ${Math.round(delay / 1000)}s (retry ${retryCount})`);
         await sleep(delay);
       }
     }
   }
-
-  log(videoId, "ERROR", `Max retries exceeded for ${videoId} — giving up`);
-  activeStreams.set(videoId, { status: "failed", since: new Date().toISOString() });
 }
 
-// ─── CHANNEL → LIVE VIDEO AUTO-DETECTION ─────────────────────────────────────
-/**
- * Checks if a YouTube channel currently has an active live stream,
- * and returns the video ID if found.
- */
+// ─── CHANNEL WATCHER ──────────────────────────────────────────────────────────
 async function detectLiveStream(channelId) {
   try {
-    const url = `https://www.youtube.com/@${channelId}/live`;
-    const res = await axios.get(url, { headers: BROWSER_HEADERS, timeout: 15_000 });
+    const res = await axios.get(
+      `https://www.youtube.com/@${channelId}/live`,
+      { headers: BROWSER_HEADERS, timeout: 15_000 }
+    );
     const html = res.data;
-
-    // Extract current video ID from the live redirect page
-    const vidMatch = html.match(/"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/);
-    const isLive = html.includes('"isLive":true') || html.includes('"liveBroadcastDetails"');
-
+    const isLive = html.includes('"isLive":true');
+    const vidMatch = html.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
     if (vidMatch && isLive) return vidMatch[1];
-
-    // Fallback: look for watch?v= in page
-    const watchMatch = html.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
-    if (watchMatch && isLive) return watchMatch[1];
   } catch (err) {
     console.error(`[CHANNEL] [${channelId}] Detection failed: ${err.message}`);
   }
   return null;
 }
 
-/**
- * Continuously monitors a channel and auto-attaches to new live streams.
- */
 async function channelWatcher(channelId) {
   console.log(`[CHANNEL] Watching channel: ${channelId}`);
   const activeVideoIds = new Set();
@@ -413,18 +420,15 @@ async function channelWatcher(channelId) {
     try {
       const videoId = await detectLiveStream(channelId);
       if (videoId && !activeVideoIds.has(videoId)) {
-        console.log(`[CHANNEL] Detected live stream ${videoId} on channel ${channelId}`);
+        console.log(`[CHANNEL] Detected live stream ${videoId} on ${channelId}`);
         activeVideoIds.add(videoId);
-        // Launch a stream listener for this video (non-blocking)
         streamListener(videoId).catch(err =>
           console.error(`[STREAM] ${videoId} crashed: ${err.message}`)
         );
       }
     } catch (err) {
-      console.error(`[CHANNEL] ${channelId} watcher error: ${err.message}`);
+      console.error(`[CHANNEL] ${channelId} error: ${err.message}`);
     }
-
-    // Check for new live streams every 60s (this is channel detection, not chat polling)
     await sleep(60_000);
   }
 }
@@ -455,8 +459,7 @@ function startStatusServer() {
   });
 
   app.get("/logs/:videoId", (req, res) => {
-    const logs = streamLogs.get(req.params.videoId) || [];
-    res.json(logs);
+    res.json(streamLogs.get(req.params.videoId) || []);
   });
 
   app.listen(PORT, () => {
@@ -464,10 +467,10 @@ function startStatusServer() {
   });
 }
 
-// ─── UTILITIES ────────────────────────────────────────────────────────────────
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// ─── UTILS ────────────────────────────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── ENTRY POINT ──────────────────────────────────────────────────────────────
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log("═══════════════════════════════════════════");
   console.log("  YouTube Live Chat Notifier");
@@ -478,17 +481,15 @@ async function main() {
 
   startStatusServer();
 
-  // Launch a stream listener per configured video ID (parallel)
   for (const videoId of TARGET_VIDEO_IDS) {
     streamListener(videoId).catch(err =>
       console.error(`[STREAM] ${videoId} crashed: ${err.message}`)
     );
   }
 
-  // Launch channel watchers for auto-detection (parallel)
   for (const channelId of TARGET_CHANNEL_IDS) {
     channelWatcher(channelId).catch(err =>
-      console.error(`[CHANNEL] ${channelId} watcher crashed: ${err.message}`)
+      console.error(`[CHANNEL] ${channelId} crashed: ${err.message}`)
     );
   }
 }
