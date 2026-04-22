@@ -4,6 +4,14 @@ const express = require("express");
 const http = require("http");
 const https = require("https");
 
+// ─── CRASH PROTECTION ─────────────────────────────────────────────────────────
+process.on("uncaughtException", err => {
+  console.error("[FATAL] uncaughtException:", err?.stack || err);
+});
+process.on("unhandledRejection", err => {
+  console.error("[FATAL] unhandledRejection:", err?.stack || err);
+});
+
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TARGET_CHANNEL_IDS = (process.env.TARGET_CHANNEL_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
@@ -13,31 +21,25 @@ const NTFY_TOPIC        = process.env.NTFY_TOPIC || "";
 const YOUTUBE_COOKIES   = process.env.YOUTUBE_COOKIES || "";
 const PORT              = process.env.PORT || 3000;
 
-// Aggressive polling: override YT's suggested timeout (usually 5000ms) with floor/ceil
-const MIN_POLL_MS       = parseInt(process.env.MIN_POLL_MS || "800", 10);
-const MAX_POLL_MS       = parseInt(process.env.MAX_POLL_MS || "2000", 10);
+// Polling tuning
+const MIN_POLL_MS       = parseInt(process.env.MIN_POLL_MS || "500", 10);
+const MAX_POLL_MS       = parseInt(process.env.MAX_POLL_MS || "1500", 10);
+const ACTIVE_POLL_MS    = parseInt(process.env.ACTIVE_POLL_MS || "400", 10); // when chat is active
 const CHANNEL_CHECK_MS  = parseInt(process.env.CHANNEL_CHECK_MS || "20000", 10);
 
 if (!NTFY_TOPIC) throw new Error("NTFY_TOPIC env var is required");
 
-// ─── HTTP CLIENTS WITH KEEP-ALIVE (huge latency win) ──────────────────────────
+// ─── HTTP CLIENTS WITH KEEP-ALIVE ─────────────────────────────────────────────
 const httpAgent  = new http.Agent({
-  keepAlive: true,
-  maxSockets: 64,
-  keepAliveMsecs: 30_000,
+  keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000,
 });
 const httpsAgent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 64,
-  keepAliveMsecs: 30_000,
+  keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000,
 });
-
-// Raise listener limit — we have many concurrent workers sharing socket pool
 require("events").EventEmitter.defaultMaxListeners = 50;
 httpAgent.setMaxListeners(50);
 httpsAgent.setMaxListeners(50);
 
-// Dedicated axios instance — reuses sockets → saves ~200–500ms per request
 const yt = axios.create({
   httpAgent, httpsAgent,
   timeout: 15_000,
@@ -45,21 +47,23 @@ const yt = axios.create({
   responseType: "json",
   validateStatus: s => s >= 200 && s < 300,
 });
-
 const ntfyClient = axios.create({
   httpAgent, httpsAgent,
   timeout: 5_000,
 });
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
+// seenMessageIds: Map<videoId, Map<msgId, timestamp>> — TTL-based so evicted IDs don't re-fire
 const seenMessageIds = new Map();
 const streamLogs     = new Map();
 const activeStreams  = new Map();
 const userCooldowns  = new Map();
+const skipFirstBatch = new Map(); // Map<videoId, boolean> — don't notify for history on reconnect
 
-const COOLDOWN_MS     = 10_000;
-const LOG_MAX_ENTRIES = 200;
-const MAX_SEEN_IDS    = 5000;
+const COOLDOWN_MS       = 10_000;
+const LOG_MAX_ENTRIES   = 100;
+const SEEN_TTL_MS       = 6 * 60 * 60 * 1000; // 6 hours — longer than any typical stream interruption
+const SEEN_MAX_PER_VID  = 20_000;
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -88,7 +92,6 @@ function getBrowserHeaders() {
   if (YOUTUBE_COOKIES) h.Cookie = YOUTUBE_COOKIES;
   return h;
 }
-
 function getApiHeaders() {
   const h = {
     "User-Agent": UA,
@@ -104,7 +107,7 @@ function getApiHeaders() {
   return h;
 }
 
-// ─── AXIOS WITH RETRY (only retry on 429/5xx) ─────────────────────────────────
+// ─── AXIOS WITH RETRY ─────────────────────────────────────────────────────────
 async function request(config, label, maxRetries = 3) {
   let attempt = 0;
   while (true) {
@@ -165,10 +168,8 @@ async function fetchInitialChatData(videoId) {
   return { continuation, apiKey, clientVersion, visitorData };
 }
 
-// ─── EXTRACT CONTINUATION TOKEN ───────────────────────────────────────────────
 function extractInitialContinuation(ytData, html) {
   const candidates = [];
-
   try {
     const continuations = ytData?.contents?.twoColumnWatchNextResults
       ?.conversationBar?.liveChatRenderer?.continuations || [];
@@ -179,7 +180,6 @@ function extractInitialContinuation(ytData, html) {
       );
     }
   } catch {}
-
   try {
     for (const panel of ytData?.engagementPanels || []) {
       const renderer = panel?.engagementPanelSectionListRenderer?.content?.liveChatRenderer;
@@ -191,13 +191,11 @@ function extractInitialContinuation(ytData, html) {
       }
     }
   } catch {}
-
   try {
     const str = JSON.stringify(ytData);
     const matches = [...str.matchAll(/"continuation"\s*:\s*"([^"]{20,})"/g)];
     for (const m of matches) candidates.push(m[1]);
   } catch {}
-
   return candidates.filter(Boolean)[0] || null;
 }
 
@@ -259,22 +257,46 @@ function parseChatResponse(data) {
     let text = "";
     for (let i = 0; i < runs.length; i++) text += runs[i].text || "";
 
-    if (id && text) messages.push({ id, authorName, authorChannelId, text });
+    // Message timestamp from YouTube (microseconds) — use to detect stale history
+    const tsUsec = parseInt(item.timestampUsec || "0", 10);
+
+    if (id && text) messages.push({ id, authorName, authorChannelId, text, tsUsec });
   }
   return { messages, nextContinuation, timeoutMs };
 }
 
-// ─── DEDUPLICATION ────────────────────────────────────────────────────────────
+// ─── DEDUPLICATION WITH TTL ───────────────────────────────────────────────────
 function isSeen(videoId, msgId) {
-  const set = seenMessageIds.get(videoId);
-  return set ? set.has(msgId) : false;
+  const map = seenMessageIds.get(videoId);
+  return map ? map.has(msgId) : false;
 }
 function markSeen(videoId, msgId) {
-  let set = seenMessageIds.get(videoId);
-  if (!set) { set = new Set(); seenMessageIds.set(videoId, set); }
-  set.add(msgId);
-  if (set.size > MAX_SEEN_IDS) set.delete(set.values().next().value);
+  let map = seenMessageIds.get(videoId);
+  if (!map) { map = new Map(); seenMessageIds.set(videoId, map); }
+  map.set(msgId, Date.now());
 }
+
+// Periodic cleanup — remove entries older than TTL, enforce max size
+function cleanupSeen() {
+  const now = Date.now();
+  for (const [videoId, map] of seenMessageIds.entries()) {
+    // TTL eviction
+    for (const [id, ts] of map.entries()) {
+      if (now - ts > SEEN_TTL_MS) map.delete(id);
+    }
+    // Hard cap — remove oldest if too big
+    while (map.size > SEEN_MAX_PER_VID) {
+      const firstKey = map.keys().next().value;
+      map.delete(firstKey);
+    }
+    if (map.size === 0) seenMessageIds.delete(videoId);
+  }
+  // Cleanup cooldowns too
+  for (const [key, ts] of userCooldowns.entries()) {
+    if (now - ts > COOLDOWN_MS * 10) userCooldowns.delete(key);
+  }
+}
+setInterval(cleanupSeen, 5 * 60 * 1000); // every 5 minutes
 
 function isOnCooldown(videoId, authorId) {
   return Date.now() - (userCooldowns.get(`${videoId}:${authorId}`) || 0) < COOLDOWN_MS;
@@ -283,7 +305,7 @@ function setCooldown(videoId, authorId) {
   userCooldowns.set(`${videoId}:${authorId}`, Date.now());
 }
 
-// ─── NTFY (fire-and-forget for lowest latency) ────────────────────────────────
+// ─── NTFY (fire-and-forget with catch) ────────────────────────────────────────
 function sendNotification(videoId, authorName, messageText) {
   ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, messageText, {
     headers: {
@@ -300,12 +322,19 @@ function sendNotification(videoId, authorName, messageText) {
 }
 
 // ─── PROCESS MESSAGES ─────────────────────────────────────────────────────────
-function processMessages(videoId, messages) {
+function processMessages(videoId, messages, isFirstBatch) {
   const targets = TARGET_CHANNEL_IDS.length === 0 ? null : new Set(TARGET_CHANNEL_IDS);
+
+  // On reconnect, we want to mark all history as "seen" WITHOUT notifying,
+  // so that only genuinely new messages trigger notifications.
+  const silent = isFirstBatch && skipFirstBatch.get(videoId) === true;
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (isSeen(videoId, msg.id)) continue;
     markSeen(videoId, msg.id);
+
+    if (silent) continue; // skip notifications for history on reconnect
 
     if (targets && !targets.has(msg.authorChannelId)) continue;
     if (isOnCooldown(videoId, msg.authorChannelId)) continue;
@@ -314,14 +343,17 @@ function processMessages(videoId, messages) {
     log(videoId, "MATCH", `${msg.authorName}: ${msg.text}`);
     sendNotification(videoId, msg.authorName, msg.text);
   }
+
+  if (isFirstBatch) skipFirstBatch.set(videoId, false);
 }
 
-// ─── STREAM LISTENER (with request pipelining) ────────────────────────────────
+// ─── STREAM LISTENER ──────────────────────────────────────────────────────────
 async function streamListener(videoId) {
   log(videoId, "INFO", "Starting stream listener");
   activeStreams.set(videoId, { status: "initializing", since: new Date().toISOString() });
 
   let retryCount = 0;
+  let hasConnectedBefore = false;
 
   while (true) {
     try {
@@ -334,8 +366,14 @@ async function streamListener(videoId) {
       retryCount = 0;
       log(videoId, "INFO", "✅ Connected to live chat");
 
+      // On RECONNECT, skip notifications for the first batch (which is history)
+      // On first ever connect, we also skip history to avoid old message spam
+      skipFirstBatch.set(videoId, true);
+      hasConnectedBefore = true;
+
       let continuation = initCont;
       let pendingFetch = null;
+      let isFirst = true;
 
       while (continuation) {
         const fetchPromise = pendingFetch ||
@@ -344,18 +382,26 @@ async function streamListener(videoId) {
 
         const { messages, nextContinuation, timeoutMs } = await fetchPromise;
 
+        // Dynamic polling: if we got messages, chat is active → poll faster
+        // If empty, use server's suggested timeout (capped)
+        const effectiveWait = messages.length > 0
+          ? Math.max(ACTIVE_POLL_MS, MIN_POLL_MS)
+          : timeoutMs;
+
         if (nextContinuation) {
           const nextStart = Date.now();
-          const requiredWait = timeoutMs;
+          // Kick off next fetch IMMEDIATELY (don't wait) — pipeline
+          pendingFetch = fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, nextContinuation)
+            .catch(err => { throw err; }); // Propagate to outer
 
-          processMessages(videoId, messages);
+          processMessages(videoId, messages, isFirst);
+          isFirst = false;
 
           const elapsed = Date.now() - nextStart;
-          if (elapsed < requiredWait) await sleep(requiredWait - elapsed);
-
-          pendingFetch = fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, nextContinuation);
+          if (elapsed < effectiveWait) await sleep(effectiveWait - elapsed);
         } else {
-          processMessages(videoId, messages);
+          processMessages(videoId, messages, isFirst);
+          isFirst = false;
         }
 
         continuation = nextContinuation;
@@ -433,7 +479,11 @@ async function channelWatcher(channelId) {
 // ─── STATUS SERVER ────────────────────────────────────────────────────────────
 function startStatusServer() {
   const app = express();
-  app.get("/", (req, res) => res.json({ status: "running", uptime: process.uptime() }));
+  app.get("/", (req, res) => res.json({
+    status: "running",
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+  }));
   app.get("/status", (req, res) => {
     const streams = {};
     for (const [id, info] of activeStreams.entries()) {
@@ -445,7 +495,8 @@ function startStatusServer() {
     }
     res.json({
       uptime: process.uptime(),
-      config: { MIN_POLL_MS, MAX_POLL_MS, CHANNEL_CHECK_MS },
+      memory: process.memoryUsage(),
+      config: { MIN_POLL_MS, MAX_POLL_MS, ACTIVE_POLL_MS, CHANNEL_CHECK_MS },
       monitoredVideos: TARGET_VIDEO_IDS,
       monitoredChannels: TARGET_CHANNEL_IDS,
       streams,
@@ -460,12 +511,12 @@ function startStatusServer() {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log("═══════════════════════════════════════════");
-  console.log("  YouTube Live Chat Notifier (real-time)");
-  console.log(`  Poll window: ${MIN_POLL_MS}–${MAX_POLL_MS}ms`);
+  console.log("  YouTube Live Chat Notifier (real-time v2)");
+  console.log(`  Poll: ${MIN_POLL_MS}–${MAX_POLL_MS}ms (active ${ACTIVE_POLL_MS}ms)`);
   console.log(`  Videos  : ${TARGET_VIDEO_IDS.join(", ") || "(none)"}`);
   console.log(`  Channels: ${TARGET_CHANNEL_IDS.join(", ") || "(none)"}`);
   console.log(`  ntfy    : https://ntfy.sh/${NTFY_TOPIC}`);
-  console.log(`  Cookies : ${YOUTUBE_COOKIES ? "✅" : "❌ (recommended!)"}`);
+  console.log(`  Cookies : ${YOUTUBE_COOKIES ? "✅" : "❌"}`);
   console.log("═══════════════════════════════════════════");
 
   startStatusServer();
