@@ -4,7 +4,7 @@
   "description": "Real-time YouTube live chat notifier with auto-restart and memory monitoring",
   "main": "index.js",
   "scripts": {
-    "start": "node --expose-gc --max-old-space-size=400 index.js",
+    "start": "node --expose-gc --max-old-space-size=850 index.js",
     "start:pro": "node --expose-gc --max-old-space-size=3200 index.js",
     "dev": "node --expose-gc index.js",
     "test": "echo \"No tests yet\" && exit 0"
