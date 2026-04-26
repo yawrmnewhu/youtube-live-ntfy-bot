@@ -23,10 +23,9 @@ const YOUTUBE_COOKIES   = process.env.YOUTUBE_COOKIES || "";
 const PORT              = process.env.PORT || 3000;
 
 const MIN_POLL_MS       = parseInt(process.env.MIN_POLL_MS || "300", 10);
-const MAX_POLL_MS       = parseInt(process.env.MAX_POLL_MS || "800", 10);
-const ACTIVE_POLL_MS    = parseInt(process.env.ACTIVE_POLL_MS || "200", 10);
+const MAX_POLL_MS       = parseInt(process.env.MAX_POLL_MS || "1500", 10);
+const ACTIVE_POLL_MS    = parseInt(process.env.ACTIVE_POLL_MS || "250", 10);
 const CHANNEL_CHECK_MS  = parseInt(process.env.CHANNEL_CHECK_MS || "20000", 10);
-const NTFY_TIMEOUT_MS   = parseInt(process.env.NTFY_TIMEOUT_MS || "3000", 10);
 
 // ─── AUTO-RESTART CONFIG ──────────────────────────────────────────────────────
 const MEM_WARN_MB       = parseInt(process.env.MEM_WARN_MB       || "350", 10);
@@ -47,13 +46,7 @@ const yt = axios.create({
   httpAgent, httpsAgent, timeout: 15_000, maxRedirects: 3,
   responseType: "json", validateStatus: s => s >= 200 && s < 300,
 });
-
-// Optimized ntfy client for instant delivery
-const ntfyClient = axios.create({
-  httpAgent, httpsAgent,
-  timeout: NTFY_TIMEOUT_MS,
-  validateStatus: s => s >= 200 && s < 300,
-});
+const ntfyClient = axios.create({ httpAgent, httpsAgent, timeout: 5_000 });
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const seenMessageIds = new Map();
@@ -61,7 +54,6 @@ const streamLogs     = new Map();
 const activeStreams  = new Map();
 const userCooldowns  = new Map();
 const skipFirstBatch = new Map();
-const notificationQueue = [];
 
 const COOLDOWN_MS       = 10_000;
 const LOG_MAX_ENTRIES   = 100;
@@ -71,41 +63,6 @@ const SEEN_MAX_PER_VID  = 5_000;
 let isShuttingDown    = false;
 let restartScheduled  = false;
 const startTime       = Date.now();
-
-// ─── EMOJI MAPPINGS ───────────────────────────────────────────────────────────
-const EMOJI_MAP = {
-  "🔥": "fire", "💯": "perfect", "👍": "like", "❤️": "love",
-  "😂": "laugh", "😭": "cry", "🎉": "celebrate", "🚀": "rocket",
-  "⚡": "lightning", "💪": "strong", "🙏": "pray", "😍": "love_face",
-  "💔": "heartbreak", "👏": "clap", "🤔": "think", "😱": "shocked",
-  "🎊": "party", "✨": "sparkle", "🌟": "star", "💝": "gift",
-  "🎯": "target", "👌": "ok", "😎": "cool", "🤗": "hug",
-};
-
-function extractEmojis(text) {
-  const emojiRegex = /\p{Emoji}/gu;
-  const matches = text.match(emojiRegex) || [];
-  return [...new Set(matches)]; // Unique emojis
-}
-
-function enhanceMessageWithEmojis(text) {
-  // Preserve original emojis in text and add tags
-  const emojis = extractEmojis(text);
-  let tags = "youtube,live,chat";
-  
-  if (emojis.length > 0) {
-    tags += "," + emojis.slice(0, 3).join(",");
-  }
-  
-  // Auto-detect sentiment/topic from keywords
-  if (text.toLowerCase().includes("fire") || text.includes("🔥")) tags += ",fire";
-  if (text.toLowerCase().includes("love") || text.includes("❤️")) tags += ",love";
-  if (text.toLowerCase().includes("haha") || text.includes("😂")) tags += ",funny";
-  if (text.toLowerCase().includes("win") || text.includes("🎉")) tags += ",celebrate";
-  if (text.toLowerCase().includes("help") || text.includes("🆘")) tags += ",urgent";
-  
-  return { enhancedText: text, tags: tags.split(",").filter(Boolean).slice(0, 10) };
-}
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -144,14 +101,10 @@ async function gracefulShutdown(reason) {
   try {
     await Promise.race([
       ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, `Service restarting: ${reason}`, {
-        headers: {
-          Title: "🔄 Auto-restart",
-          Tags: "warning",
-          Priority: "high",
-          "Content-Type": "text/plain; charset=utf-8",
-        },
+        headers: { Title: "🔄 Auto-restart", Tags: "warning", Priority: "low" },
+        timeout: 3000,
       }),
-      sleep(NTFY_TIMEOUT_MS),
+      sleep(3000),
     ]);
   } catch {}
 
@@ -172,7 +125,6 @@ async function gracefulShutdown(reason) {
   activeStreams.clear();
   userCooldowns.clear();
   skipFirstBatch.clear();
-  notificationQueue.length = 0;
 
   console.log(`[RESTART] Exiting in ${SHUTDOWN_GRACE_MS}ms...`);
   await sleep(SHUTDOWN_GRACE_MS);
@@ -222,7 +174,7 @@ function getStateSize() {
   for (const m of seenMessageIds.values()) total += m.size;
   return {
     seenMessages: total, videos: seenMessageIds.size, logs: streamLogs.size,
-    streams: activeStreams.size, cooldowns: userCooldowns.size, queuedNotifications: notificationQueue.length,
+    streams: activeStreams.size, cooldowns: userCooldowns.size,
   };
 }
 
@@ -240,17 +192,12 @@ function getBrowserHeaders() {
   if (YOUTUBE_COOKIES) h.Cookie = YOUTUBE_COOKIES;
   return h;
 }
-
 function getApiHeaders() {
   const h = {
-    "User-Agent": UA,
-    "Content-Type": "application/json",
-    "Accept": "*/*",
+    "User-Agent": UA, "Content-Type": "application/json", "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br",
-    "Origin": "https://www.youtube.com",
-    "Referer": "https://www.youtube.com/",
-    "X-Youtube-Client-Name": "1",
-    "X-Youtube-Client-Version": "2.20240101.00.00",
+    "Origin": "https://www.youtube.com", "Referer": "https://www.youtube.com/",
+    "X-Youtube-Client-Name": "1", "X-Youtube-Client-Version": "2.20240101.00.00",
   };
   if (YOUTUBE_COOKIES) h.Cookie = YOUTUBE_COOKIES;
   return h;
@@ -282,10 +229,8 @@ async function request(config, label, maxRetries = 3) {
 // ─── FETCH INITIAL CHAT DATA ──────────────────────────────────────────────────
 async function fetchInitialChatData(videoId) {
   const res = await request({
-    method: "get",
-    url: `https://www.youtube.com/watch?v=${videoId}`,
-    headers: getBrowserHeaders(),
-    responseType: "text",
+    method: "get", url: `https://www.youtube.com/watch?v=${videoId}`,
+    headers: getBrowserHeaders(), responseType: "text",
     transformResponse: [d => d],
   }, videoId);
 
@@ -363,6 +308,46 @@ async function fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, co
   return parseChatResponse(res.data);
 }
 
+// ─── EMOJI EXTRACTION ─────────────────────────────────────────────────────────
+// YouTube chat runs come in two main forms:
+//   { text: "hello" }                                 → plain text (already includes keyboard/unicode emojis)
+//   { emoji: { emojiId, shortcuts:[":smile:"], image:{accessibility:{accessibilityData:{label:"smiley face"}}}, isCustomEmoji: true/false } }
+//
+// For STANDARD (unicode) emojis YouTube sends, `emoji.emojiId` is literally the unicode char (e.g. "😀")
+// and `shortcuts[0]` is like ":grinning_face:". We prefer the unicode char so notifications show the real emoji.
+//
+// For CUSTOM channel emojis (membership / sub emotes), there is no unicode equivalent — we fall back to
+// the shortcut (e.g. ":_happy:") so the user at least sees *something* meaningful instead of an empty msg.
+function extractRunText(run) {
+  if (!run) return "";
+
+  // Plain text run — keyboard/unicode emojis typed by the user arrive here directly.
+  if (typeof run.text === "string") return run.text;
+
+  // Emoji run — YouTube-rendered emoji (unicode or custom).
+  if (run.emoji) {
+    const e = run.emoji;
+    const isCustom = e.isCustomEmoji === true;
+
+    if (!isCustom) {
+      // Standard unicode emoji: emojiId IS the unicode character(s).
+      if (e.emojiId && typeof e.emojiId === "string") return e.emojiId;
+    }
+
+    // Custom emoji (or fallback): use a shortcut like :happy:
+    if (Array.isArray(e.shortcuts) && e.shortcuts.length > 0) return e.shortcuts[0];
+
+    // Last-ditch: accessibility label ("smiling face with heart eyes")
+    const label = e?.image?.accessibility?.accessibilityData?.label;
+    if (label) return `:${label}:`;
+
+    // Absolute fallback so nothing is silently dropped.
+    if (e.emojiId) return e.emojiId;
+  }
+
+  return "";
+}
+
 function parseChatResponse(data) {
   const messages = [];
   let nextContinuation = null;
@@ -394,10 +379,11 @@ function parseChatResponse(data) {
     const authorChannelId = item.authorExternalChannelId || "";
     const runs = item.message?.runs || item.headerSubtext?.runs || [];
     let text = "";
-    for (let i = 0; i < runs.length; i++) text += runs[i].text || "";
+    for (let i = 0; i < runs.length; i++) text += extractRunText(runs[i]);
     const tsUsec = parseInt(item.timestampUsec || "0", 10);
 
-    if (id && text) messages.push({ id, authorName, authorChannelId, text, tsUsec });
+    // Allow messages that have *any* content (text OR emoji). Previously emoji-only msgs were dropped.
+    if (id && text.length > 0) messages.push({ id, authorName, authorChannelId, text, tsUsec });
   }
   return { messages, nextContinuation, timeoutMs };
 }
@@ -407,7 +393,6 @@ function isSeen(videoId, msgId) {
   const map = seenMessageIds.get(videoId);
   return map ? map.has(msgId) : false;
 }
-
 function markSeen(videoId, msgId) {
   let map = seenMessageIds.get(videoId);
   if (!map) { map = new Map(); seenMessageIds.set(videoId, map); }
@@ -430,64 +415,34 @@ function cleanupSeen() {
     if (now - ts > COOLDOWN_MS * 10) userCooldowns.delete(key);
   }
 }
-
 setInterval(cleanupSeen, 5 * 60 * 1000);
 
 function isOnCooldown(videoId, authorId) {
   return Date.now() - (userCooldowns.get(`${videoId}:${authorId}`) || 0) < COOLDOWN_MS;
 }
-
 function setCooldown(videoId, authorId) {
   userCooldowns.set(`${videoId}:${authorId}`, Date.now());
 }
 
-// ─── NTFY WITH INSTANT DELIVERY ────────────────────────────────────────────────
-async function sendNotificationAsync(videoId, authorName, messageText) {
-  const { enhancedText, tags } = enhanceMessageWithEmojis(messageText);
-  
-  const notificationData = {
-    videoId,
-    authorName,
-    messageText: enhancedText,
-    tags,
-    timestamp: new Date().toISOString(),
-  };
+// ─── NTFY ─────────────────────────────────────────────────────────────────────
+function sendNotification(videoId, authorName, messageText) {
+  // Body + title must be UTF-8 encoded for emojis. ntfy requires RFC 2047 / base64 for
+  // non-ASCII header values, so we base64-encode the title & body to preserve emojis.
+  const bodyBuf = Buffer.from(messageText, "utf8");
+  const titleStr = `💬 ${authorName} in ${videoId}`;
 
-  // Add to queue for processing
-  notificationQueue.push(notificationData);
-
-  // Send immediately (non-blocking)
-  setImmediate(() => {
-    ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, enhancedText, {
-      headers: {
-        Title: `💬 ${authorName}`,
-        Tags: tags.join(","),
-        Priority: "high",
-        "Content-Type": "text/plain; charset=utf-8",
-      },
-    }).then(() => {
-      log(videoId, "NOTIFY", `✅ ${authorName}: ${enhancedText.slice(0, 60)}`);
-      // Remove from queue after successful send
-      const idx = notificationQueue.indexOf(notificationData);
-      if (idx > -1) notificationQueue.splice(idx, 1);
-    }).catch(err => {
-      log(videoId, "ERROR", `ntfy failed: ${err.message}`);
-      // Retry on failure
-      setTimeout(() => {
-        ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, enhancedText, {
-          headers: {
-            Title: `💬 ${authorName}`,
-            Tags: tags.join(","),
-            Priority: "high",
-            "Content-Type": "text/plain; charset=utf-8",
-          },
-        }).catch(retryErr => {
-          log(videoId, "ERROR", `ntfy retry failed: ${retryErr.message}`);
-          const idx = notificationQueue.indexOf(notificationData);
-          if (idx > -1) notificationQueue.splice(idx, 1);
-        });
-      }, 1000);
-    });
+  ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, bodyBuf, {
+    headers: {
+      // Base64-encoded title so emojis in author names / title survive HTTP headers.
+      Title: "=?UTF-8?B?" + Buffer.from(titleStr, "utf8").toString("base64") + "?=",
+      Tags: "youtube,live",
+      Priority: "high",
+      "Content-Type": "text/plain; charset=utf-8",
+    },
+  }).then(() => {
+    log(videoId, "NOTIFY", `${authorName}: ${messageText.slice(0, 60)}`);
+  }).catch(err => {
+    log(videoId, "ERROR", `ntfy failed: ${err.message}`);
   });
 }
 
@@ -506,7 +461,7 @@ function processMessages(videoId, messages, isFirstBatch) {
 
     setCooldown(videoId, msg.authorChannelId);
     log(videoId, "MATCH", `${msg.authorName}: ${msg.text}`);
-    sendNotificationAsync(videoId, msg.authorName, msg.text);
+    sendNotification(videoId, msg.authorName, msg.text);
   }
   if (isFirstBatch) skipFirstBatch.set(videoId, false);
 }
@@ -557,6 +512,7 @@ async function streamListener(videoId) {
             pendingFetch = fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, nextContinuation)
               .catch(err => ({ __error: err }));
 
+            // Process (and send notifications) BEFORE waiting, so latency is minimized.
             processMessages(videoId, messages, isFirst);
             isFirst = false;
 
@@ -694,11 +650,6 @@ function startStatusServer() {
       monitoredVideos: TARGET_VIDEO_IDS,
       monitoredChannels: TARGET_CHANNEL_IDS,
       streams,
-      queuedNotifications: notificationQueue.map(n => ({
-        author: n.authorName,
-        message: n.messageText.slice(0, 50),
-        tags: n.tags,
-      })),
     });
   });
   app.get("/logs/:videoId", (req, res) =>
