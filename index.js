@@ -35,6 +35,12 @@ const MEM_CHECK_MS      = parseInt(process.env.MEM_CHECK_MS      || "15000", 10)
 const MAX_UPTIME_HOURS  = parseInt(process.env.MAX_UPTIME_HOURS  || "24", 10);
 const SHUTDOWN_GRACE_MS = parseInt(process.env.SHUTDOWN_GRACE_MS || "10000", 10);
 
+// ─── NTFY 429 AUTO-RESTART CONFIG ─────────────────────────────────────────────
+// Restart immediately on the first 429 (default), or after N within a window.
+const NTFY_429_THRESHOLD   = parseInt(process.env.NTFY_429_THRESHOLD   || "1", 10);
+const NTFY_429_WINDOW_MS   = parseInt(process.env.NTFY_429_WINDOW_MS   || "60000", 10);
+const NTFY_429_RESTART_DELAY_MS = parseInt(process.env.NTFY_429_RESTART_DELAY_MS || "2000", 10);
+
 if (!NTFY_TOPIC) throw new Error("NTFY_TOPIC env var is required");
 
 // ─── HTTP CLIENTS ─────────────────────────────────────────────────────────────
@@ -63,6 +69,9 @@ const SEEN_MAX_PER_VID  = 5_000;
 let isShuttingDown    = false;
 let restartScheduled  = false;
 const startTime       = Date.now();
+
+// ntfy 429 tracking
+const ntfy429Timestamps = [];
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -98,15 +107,19 @@ async function gracefulShutdown(reason) {
   console.log(`  Memory: RSS=${mem.rss.toFixed(1)}MB Heap=${mem.heap.toFixed(1)}MB`);
   console.log(`  Uptime: ${((Date.now() - startTime) / 1000 / 60).toFixed(1)} min`);
 
-  try {
-    await Promise.race([
-      ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, `Service restarting: ${reason}`, {
-        headers: { Title: "🔄 Auto-restart", Tags: "warning", Priority: "low" },
-        timeout: 3000,
-      }),
-      sleep(3000),
-    ]);
-  } catch {}
+  // Skip ntfy notification on 429 restarts (we're already rate-limited).
+  const skipNtfy = reason.startsWith("ntfy_429");
+  if (!skipNtfy) {
+    try {
+      await Promise.race([
+        ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, `Service restarting: ${reason}`, {
+          headers: { Title: "🔄 Auto-restart", Tags: "warning", Priority: "low" },
+          timeout: 3000,
+        }),
+        sleep(3000),
+      ]);
+    } catch {}
+  }
 
   if (httpServer) {
     try {
@@ -128,6 +141,7 @@ async function gracefulShutdown(reason) {
 
   console.log(`[RESTART] Exiting in ${SHUTDOWN_GRACE_MS}ms...`);
   await sleep(SHUTDOWN_GRACE_MS);
+  // Non-zero exit → Railway restarts the service automatically.
   process.exit(1);
 }
 
@@ -309,42 +323,20 @@ async function fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, co
 }
 
 // ─── EMOJI EXTRACTION ─────────────────────────────────────────────────────────
-// YouTube chat runs come in two main forms:
-//   { text: "hello" }                                 → plain text (already includes keyboard/unicode emojis)
-//   { emoji: { emojiId, shortcuts:[":smile:"], image:{accessibility:{accessibilityData:{label:"smiley face"}}}, isCustomEmoji: true/false } }
-//
-// For STANDARD (unicode) emojis YouTube sends, `emoji.emojiId` is literally the unicode char (e.g. "😀")
-// and `shortcuts[0]` is like ":grinning_face:". We prefer the unicode char so notifications show the real emoji.
-//
-// For CUSTOM channel emojis (membership / sub emotes), there is no unicode equivalent — we fall back to
-// the shortcut (e.g. ":_happy:") so the user at least sees *something* meaningful instead of an empty msg.
 function extractRunText(run) {
   if (!run) return "";
-
-  // Plain text run — keyboard/unicode emojis typed by the user arrive here directly.
   if (typeof run.text === "string") return run.text;
-
-  // Emoji run — YouTube-rendered emoji (unicode or custom).
   if (run.emoji) {
     const e = run.emoji;
     const isCustom = e.isCustomEmoji === true;
-
     if (!isCustom) {
-      // Standard unicode emoji: emojiId IS the unicode character(s).
       if (e.emojiId && typeof e.emojiId === "string") return e.emojiId;
     }
-
-    // Custom emoji (or fallback): use a shortcut like :happy:
     if (Array.isArray(e.shortcuts) && e.shortcuts.length > 0) return e.shortcuts[0];
-
-    // Last-ditch: accessibility label ("smiling face with heart eyes")
     const label = e?.image?.accessibility?.accessibilityData?.label;
     if (label) return `:${label}:`;
-
-    // Absolute fallback so nothing is silently dropped.
     if (e.emojiId) return e.emojiId;
   }
-
   return "";
 }
 
@@ -382,7 +374,6 @@ function parseChatResponse(data) {
     for (let i = 0; i < runs.length; i++) text += extractRunText(runs[i]);
     const tsUsec = parseInt(item.timestampUsec || "0", 10);
 
-    // Allow messages that have *any* content (text OR emoji). Previously emoji-only msgs were dropped.
     if (id && text.length > 0) messages.push({ id, authorName, authorChannelId, text, tsUsec });
   }
   return { messages, nextContinuation, timeoutMs };
@@ -424,16 +415,34 @@ function setCooldown(videoId, authorId) {
   userCooldowns.set(`${videoId}:${authorId}`, Date.now());
 }
 
+// ─── NTFY 429 HANDLER ─────────────────────────────────────────────────────────
+function handleNtfy429(retryAfterHeader) {
+  const now = Date.now();
+  // Drop timestamps outside the rolling window.
+  while (ntfy429Timestamps.length && now - ntfy429Timestamps[0] > NTFY_429_WINDOW_MS) {
+    ntfy429Timestamps.shift();
+  }
+  ntfy429Timestamps.push(now);
+
+  console.error(
+    `[NTFY] 🚫 429 rate-limited (${ntfy429Timestamps.length}/${NTFY_429_THRESHOLD} in ` +
+    `${NTFY_429_WINDOW_MS}ms window)` +
+    (retryAfterHeader ? `, Retry-After=${retryAfterHeader}` : "")
+  );
+
+  if (ntfy429Timestamps.length >= NTFY_429_THRESHOLD) {
+    console.error(`[NTFY] 🚨 429 threshold hit → triggering Railway restart`);
+    scheduleRestart("ntfy_429_rate_limit", NTFY_429_RESTART_DELAY_MS);
+  }
+}
+
 // ─── NTFY ─────────────────────────────────────────────────────────────────────
 function sendNotification(videoId, authorName, messageText) {
-  // Body + title must be UTF-8 encoded for emojis. ntfy requires RFC 2047 / base64 for
-  // non-ASCII header values, so we base64-encode the title & body to preserve emojis.
   const bodyBuf = Buffer.from(messageText, "utf8");
   const titleStr = `💬 ${authorName} in ${videoId}`;
 
   ntfyClient.post(`https://ntfy.sh/${NTFY_TOPIC}`, bodyBuf, {
     headers: {
-      // Base64-encoded title so emojis in author names / title survive HTTP headers.
       Title: "=?UTF-8?B?" + Buffer.from(titleStr, "utf8").toString("base64") + "?=",
       Tags: "youtube,live",
       Priority: "high",
@@ -442,7 +451,10 @@ function sendNotification(videoId, authorName, messageText) {
   }).then(() => {
     log(videoId, "NOTIFY", `${authorName}: ${messageText.slice(0, 60)}`);
   }).catch(err => {
-    log(videoId, "ERROR", `ntfy failed: ${err.message}`);
+    const status = err?.response?.status;
+    const retryAfter = err?.response?.headers?.["retry-after"];
+    log(videoId, "ERROR", `ntfy failed${status ? ` (${status})` : ""}: ${err.message}`);
+    if (status === 429) handleNtfy429(retryAfter);
   });
 }
 
@@ -512,7 +524,6 @@ async function streamListener(videoId) {
             pendingFetch = fetchLiveChatPage(videoId, apiKey, clientVersion, visitorData, nextContinuation)
               .catch(err => ({ __error: err }));
 
-            // Process (and send notifications) BEFORE waiting, so latency is minimized.
             processMessages(videoId, messages, isFirst);
             isFirst = false;
 
@@ -630,6 +641,7 @@ function startStatusServer() {
       uptime: process.uptime(),
       memoryMB: { rss: mem.rss.toFixed(1), heap: mem.heap.toFixed(1), ext: mem.ext.toFixed(1) },
       limits: { warn: MEM_WARN_MB, restart: MEM_RESTART_MB, hard: MEM_HARD_LIMIT_MB },
+      ntfy429: { recent: ntfy429Timestamps.length, threshold: NTFY_429_THRESHOLD, windowMs: NTFY_429_WINDOW_MS },
       state: getStateSize(),
     });
   });
@@ -647,6 +659,7 @@ function startStatusServer() {
       uptime: process.uptime(),
       memoryMB: { rss: mem.rss.toFixed(1), heap: mem.heap.toFixed(1), ext: mem.ext.toFixed(1) },
       state: getStateSize(),
+      ntfy429: { recent: ntfy429Timestamps.length, threshold: NTFY_429_THRESHOLD, windowMs: NTFY_429_WINDOW_MS },
       monitoredVideos: TARGET_VIDEO_IDS,
       monitoredChannels: TARGET_CHANNEL_IDS,
       streams,
@@ -670,14 +683,15 @@ process.on("SIGINT",  () => { console.log("[SIGNAL] SIGINT");  gracefulShutdown(
 async function main() {
   console.log("═══════════════════════════════════════════");
   console.log("  YouTube Live Chat Notifier (auto-restart)");
-  console.log(`  Node    : ${process.version}`);
-  console.log(`  Poll    : ${MIN_POLL_MS}–${MAX_POLL_MS}ms (active ${ACTIVE_POLL_MS}ms)`);
-  console.log(`  Videos  : ${TARGET_VIDEO_IDS.join(", ") || "(none)"}`);
-  console.log(`  Channels: ${TARGET_CHANNEL_IDS.join(", ") || "(none)"}`);
-  console.log(`  ntfy    : https://ntfy.sh/${NTFY_TOPIC}`);
-  console.log(`  Cookies : ${YOUTUBE_COOKIES ? "✅" : "❌"}`);
-  console.log(`  Memory  : warn=${MEM_WARN_MB}MB restart=${MEM_RESTART_MB}MB hard=${MEM_HARD_LIMIT_MB}MB`);
-  console.log(`  GC      : ${global.gc ? "✅" : "❌ (start with --expose-gc)"}`);
+  console.log(`  Node     : ${process.version}`);
+  console.log(`  Poll     : ${MIN_POLL_MS}–${MAX_POLL_MS}ms (active ${ACTIVE_POLL_MS}ms)`);
+  console.log(`  Videos   : ${TARGET_VIDEO_IDS.join(", ") || "(none)"}`);
+  console.log(`  Channels : ${TARGET_CHANNEL_IDS.join(", ") || "(none)"}`);
+  console.log(`  ntfy     : https://ntfy.sh/${NTFY_TOPIC}`);
+  console.log(`  Cookies  : ${YOUTUBE_COOKIES ? "✅" : "❌"}`);
+  console.log(`  Memory   : warn=${MEM_WARN_MB}MB restart=${MEM_RESTART_MB}MB hard=${MEM_HARD_LIMIT_MB}MB`);
+  console.log(`  ntfy 429 : restart after ${NTFY_429_THRESHOLD} hit(s) / ${NTFY_429_WINDOW_MS}ms`);
+  console.log(`  GC       : ${global.gc ? "✅" : "❌ (start with --expose-gc)"}`);
   console.log("═══════════════════════════════════════════");
 
   startStatusServer();
